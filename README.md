@@ -1226,3 +1226,17 @@ MIT
 ## Contributing
 
 Contributions welcome! See [ARCHITECTURE.md](ARCHITECTURE.md) and [CLAUDE.md](CLAUDE.md) for guidelines.
+
+---
+
+## Tradebe Customizations
+
+This fork includes specific modifications for **Tradebe** environments and optimized use with **Claude Code** as an MCP server.
+
+### Key Changes
+- **Expert Mode by Default:** The binary now defaults to `expert` mode (122 tools) and enables transport management out of the box. This bypasses the CLI argument limits in some MCP runners.
+- **Auto-Enable Transports:** `SAP_ALLOW_TRANSPORTABLE_EDITS` and `SAP_ENABLE_TRANSPORTS` are set to `true` by default for seamless interaction with transportable packages.
+- **Tradebe Build Tooling:** Added `Makefile.tradebe` for simplified building and installation in local environments.
+- **Project Intelligence:** Added `GEMINI.md` for comprehensive project context and AI-agent guidance.
+
+**Maintained by:** [f1se4](https://github.com/f1se4) in collaboration with Claude Sonnet 4.6.
