@@ -121,13 +121,13 @@ func init() {
 	rootCmd.Flags().StringVar(&cfg.AllowedOps, "allowed-ops", "", "Whitelist of allowed operation types (e.g., \"RSQ\" for Read, Search, Query only)")
 	rootCmd.Flags().StringVar(&cfg.DisallowedOps, "disallowed-ops", "", "Blacklist of operation types to block (e.g., \"CDUA\" for Create, Delete, Update, Activate)")
 	rootCmd.Flags().StringSliceVar(&cfg.AllowedPackages, "allowed-packages", nil, "Restrict operations to specific packages (comma-separated, supports wildcards like Z*)")
-	rootCmd.Flags().BoolVar(&cfg.EnableTransports, "enable-transports", false, "Enable transport management operations (disabled by default for safety)")
+	rootCmd.Flags().BoolVar(&cfg.EnableTransports, "enable-transports", true, "Enable transport management operations (set to true by default in this build)")
 	rootCmd.Flags().BoolVar(&cfg.TransportReadOnly, "transport-read-only", false, "Only allow read operations on transports (list, get)")
 	rootCmd.Flags().StringSliceVar(&cfg.AllowedTransports, "allowed-transports", nil, "Restrict transport operations to specific transports (comma-separated, supports wildcards like A4HK*)")
-	rootCmd.Flags().BoolVar(&cfg.AllowTransportableEdits, "allow-transportable-edits", false, "Allow editing objects in transportable packages (requires transport parameter)")
+	rootCmd.Flags().BoolVar(&cfg.AllowTransportableEdits, "allow-transportable-edits", true, "Allow editing objects in transportable packages (requires transport parameter)")
 
 	// Mode options
-	rootCmd.Flags().StringVar(&cfg.Mode, "mode", "focused", "Tool mode: focused (100 tools), expert (147 tools), or hyperfocused (single universal SAP tool)")
+	rootCmd.Flags().StringVar(&cfg.Mode, "mode", "expert", "Tool mode: focused (100 tools), expert (147 tools), or hyperfocused (single universal SAP tool)")
 	rootCmd.Flags().StringVar(&cfg.DisabledGroups, "disabled-groups", "", "Disable tool groups: 5/U=UI5, T=Tests, H=HANA, D=Debug, GC=gCTS, N=i18n")
 
 	// Transport options
@@ -141,7 +141,7 @@ func init() {
 	rootCmd.Flags().StringVar(&cfg.FeatureRAP, "feature-rap", "auto", "RAP/OData development: auto, on, off")
 	rootCmd.Flags().StringVar(&cfg.FeatureAMDP, "feature-amdp", "auto", "AMDP/HANA debugger: auto, on, off")
 	rootCmd.Flags().StringVar(&cfg.FeatureUI5, "feature-ui5", "auto", "UI5/Fiori BSP management: auto, on, off")
-	rootCmd.Flags().StringVar(&cfg.FeatureTransport, "feature-transport", "auto", "CTS transport management: auto, on, off")
+	rootCmd.Flags().StringVar(&cfg.FeatureTransport, "feature-transport", "on", "CTS transport management: auto, on, off")
 
 	// Debugger configuration
 	rootCmd.Flags().StringVar(&cfg.TerminalID, "terminal-id", "", "SAP GUI terminal ID for cross-tool breakpoint sharing")
@@ -196,6 +196,7 @@ func init() {
 func runServer(cmd *cobra.Command, args []string) error {
 	// Resolve configuration with priority: flags > env vars > defaults
 	resolveConfig(cmd)
+
 
 	// Validate configuration
 	if err := validateConfig(); err != nil {
@@ -382,9 +383,9 @@ func resolveConfig(cmd *cobra.Command) {
 			cfg.AllowedPackages = splitCommaSeparated(pkgStr)
 		}
 	}
-	if !cmd.Flags().Changed("enable-transports") {
-		cfg.EnableTransports = viper.GetBool("ENABLE_TRANSPORTS")
-	}
+	// Always OR the env var so that SAP_ENABLE_TRANSPORTS=true works regardless
+	// of whether the CLI flag was recognised as Changed by cobra (e.g. MCP clients).
+	cfg.EnableTransports = cfg.EnableTransports || viper.GetBool("ENABLE_TRANSPORTS")
 	if !cmd.Flags().Changed("transport-read-only") {
 		cfg.TransportReadOnly = viper.GetBool("TRANSPORT_READ_ONLY")
 	}
@@ -394,9 +395,9 @@ func resolveConfig(cmd *cobra.Command) {
 			cfg.AllowedTransports = splitCommaSeparated(transportStr)
 		}
 	}
-	if !cmd.Flags().Changed("allow-transportable-edits") {
-		cfg.AllowTransportableEdits = viper.GetBool("ALLOW_TRANSPORTABLE_EDITS")
-	}
+	// Always OR the env var so that SAP_ALLOW_TRANSPORTABLE_EDITS=true works regardless
+	// of whether the CLI flag was recognised as Changed by cobra (e.g. MCP clients).
+	cfg.AllowTransportableEdits = cfg.AllowTransportableEdits || viper.GetBool("ALLOW_TRANSPORTABLE_EDITS")
 
 	// Feature configuration: flag > SAP_FEATURE_* env
 	if !cmd.Flags().Changed("feature-hana") {
@@ -424,10 +425,10 @@ func resolveConfig(cmd *cobra.Command) {
 			cfg.FeatureUI5 = v
 		}
 	}
-	if !cmd.Flags().Changed("feature-transport") {
-		if v := viper.GetString("FEATURE_TRANSPORT"); v != "" {
-			cfg.FeatureTransport = v
-		}
+	// Always prefer env var over default for feature-transport so that
+	// SAP_FEATURE_TRANSPORT=on works even when the flag isn't Changed by cobra.
+	if v := viper.GetString("FEATURE_TRANSPORT"); v != "" {
+		cfg.FeatureTransport = v
 	}
 
 	// Terminal ID for debugger: flag > SAP_TERMINAL_ID env
