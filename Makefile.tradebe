@@ -1,0 +1,21 @@
+# Tradebe build helpers for vibing-steampunk/vsp
+# Usage: make -f Makefile.tradebe build   → builds to ~/bin/vsp
+#        make -f Makefile.tradebe install → build + install
+
+BINARY     := $(HOME)/bin/vsp
+BUILD_SRC  := ./cmd/vsp/
+GO         := $(shell which go)
+
+.PHONY: build install clean
+
+build:
+	$(GO) build -o /tmp/vsp_tradebe $(BUILD_SRC)
+	@echo "Built: /tmp/vsp_tradebe"
+
+install: build
+	cp /tmp/vsp_tradebe $(BINARY)
+	@echo "Installed: $(BINARY)"
+	@$(BINARY) --version 2>/dev/null || true
+
+clean:
+	rm -f /tmp/vsp_tradebe
