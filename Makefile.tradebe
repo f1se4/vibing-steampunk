@@ -1,21 +1,45 @@
 # Tradebe build helpers for vibing-steampunk/vsp
-# Usage: make -f Makefile.tradebe build   → builds to ~/bin/vsp
-#        make -f Makefile.tradebe install → build + install
+# Usage:
+#   make -f Makefile.tradebe           → show help
+#   make -f Makefile.tradebe install   → build (with version info) + install to ~/bin/vsp
+#   make -f Makefile.tradebe install-windows → build Windows amd64 + deploy to /mnt/c/bin/vsp/
+#   make -f Makefile.tradebe clean     → remove temp artifacts
 
-BINARY     := $(HOME)/bin/vsp
-BUILD_SRC  := ./cmd/vsp/
-GO         := $(shell which go)
+GO      := $(shell which go)
+CMD_DIR := ./cmd/vsp/
 
-.PHONY: build install clean
+# Version info embedded at build time (same pattern as upstream Makefile)
+VERSION   ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo "dev")
+COMMIT    ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo "unknown")
+BUILDDATE ?= $(shell date -u +"%Y-%m-%dT%H:%M:%SZ")
+LDFLAGS   := -ldflags "-s -w -X main.Version=$(VERSION) -X main.Commit=$(COMMIT) -X main.BuildDate=$(BUILDDATE)"
 
-build:
-	$(GO) build -o /tmp/vsp_tradebe $(BUILD_SRC)
-	@echo "Built: /tmp/vsp_tradebe"
+INSTALL_DIR        := $(HOME)/bin
+WINDOWS_DEPLOY_DIR := /mnt/c/bin/vsp
+TMP_BINARY         := /tmp/vsp_tradebe
+TMP_WIN_BINARY     := /tmp/vsp_tradebe_win.exe
 
-install: build
-	cp /tmp/vsp_tradebe $(BINARY)
-	@echo "Installed: $(BINARY)"
-	@$(BINARY) --version 2>/dev/null || true
+.PHONY: build install install-windows clean help
 
-clean:
-	rm -f /tmp/vsp_tradebe
+help: ## Show this help
+	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-20s\033[0m %s\n", $$1, $$2}'
+
+build: ## Build for current platform (output: /tmp/vsp_tradebe)
+	$(GO) build $(LDFLAGS) -o $(TMP_BINARY) $(CMD_DIR)
+	@echo "Built: $(TMP_BINARY)  [$(VERSION) $(COMMIT)]"
+
+install: build ## Build + install to ~/bin/vsp
+	@mkdir -p $(INSTALL_DIR)
+	cp $(TMP_BINARY) $(INSTALL_DIR)/vsp
+	@echo "Installed: $(INSTALL_DIR)/vsp"
+	@$(INSTALL_DIR)/vsp --version 2>/dev/null || true
+
+install-windows: ## Build Windows amd64 + deploy to /mnt/c/bin/vsp/ (WSL only)
+	GOOS=windows GOARCH=amd64 $(GO) build $(LDFLAGS) -o $(TMP_WIN_BINARY) $(CMD_DIR)
+	@echo "Built: $(TMP_WIN_BINARY)  [$(VERSION) $(COMMIT)]"
+	@mkdir -p $(WINDOWS_DEPLOY_DIR)
+	cp $(TMP_WIN_BINARY) $(WINDOWS_DEPLOY_DIR)/vsp.exe
+	@echo "Deployed: $(WINDOWS_DEPLOY_DIR)/vsp.exe"
+
+clean: ## Remove temp build artifacts
+	rm -f $(TMP_BINARY) $(TMP_WIN_BINARY)

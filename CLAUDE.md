@@ -115,3 +115,124 @@ Reports: `reports/YYYY-MM-DD-NNN-title.md`. SAP objects: `ZADT_<nn>_<name>`, `ZC
 | `pkg/llvm2abap/`, `pkg/wasmcomp/` | Research | Not production; don't treat as stable |
 | `pkg/adt/debugger.go` (REST) | Deprecated | Prefer `websocket_debug.go` |
 | `docs/cli-agents/*` | Config drift | Codex TOML format may differ from Claude/Gemini JSON docs |
+
+---
+
+## Tradebe Customizations (branch: `tradebe-customizations`)
+
+This section documents fork-specific changes for Tradebe environments.
+
+### Key Differences vs Upstream
+
+| Setting | Upstream default | Tradebe default |
+|---------|-----------------|-----------------|
+| `--mode` | `focused` (100 tools) | `expert` (147 tools) |
+| `--enable-transports` | `false` | `true` |
+| `--allow-transportable-edits` | `false` | `true` |
+| `--feature-transport` | `auto` | `on` |
+
+### Build & Install
+
+```bash
+# macOS / Linux (in repo root, on branch tradebe-customizations)
+make -f Makefile.tradebe install
+# → installs to ~/bin/vsp (with version info embedded)
+
+# WSL2: also build Windows binary
+make -f Makefile.tradebe install-windows
+# → deploys vsp.exe to /mnt/c/bin/vsp/vsp.exe
+```
+
+### WSL Setup (Windows work environment)
+
+When working on **WSL2** at Tradebe, the repo is cloned in the Linux filesystem. Build and install the same way:
+
+```bash
+# 1. Clone / pull in WSL
+cd ~/workspaces
+git clone https://github.com/f1se4/vibing-steampunk.git
+cd vibing-steampunk
+git checkout tradebe-customizations
+
+# 2. Install Go if needed (WSL Ubuntu)
+sudo apt install golang-go   # or use https://go.dev/dl/ for latest
+
+# 3. Build & install
+make -f Makefile.tradebe install
+# → binary lands at ~/bin/vsp  (ensure ~/bin is in $PATH)
+
+# 4. Verify
+vsp --version
+```
+
+**MCP config on WSL** — add to `~/.claude/settings.json` (or `~/.config/claude/settings.json`):
+
+```json
+{
+  "mcpServers": {
+    "sap": {
+      "command": "/home/<user>/bin/vsp",
+      "env": {
+        "SAP_URL": "http://<host>:50000",
+        "SAP_USER": "<user>",
+        "SAP_PASSWORD": "<pass>",
+        "SAP_CLIENT": "100"
+      }
+    }
+  }
+}
+```
+
+### Sync Upstream (update the fork)
+
+```bash
+# Fetch + merge upstream into main, then rebase tradebe on top
+git checkout main
+git fetch upstream
+git merge upstream/main --no-edit
+git push origin main
+
+git checkout tradebe-customizations
+git rebase main
+git push --force-with-lease origin tradebe-customizations
+
+# Rebuild
+make -f Makefile.tradebe install
+```
+
+---
+
+## Last Session Reference (2026-04-06)
+
+### Objective: Sync upstream v2.33.0–v2.37.0 — COMPLETED ✅
+
+Merged ~100 commits (v2.33–v2.37) from upstream into our fork and rebased `tradebe-customizations`.
+
+### What's New (relevant for Tradebe)
+
+1. ✅ **Graph Engine** (`pkg/graph/`) — package boundary analysis, impact analysis, mermaid/HTML exports
+   - `vsp graph <object>` — call graph with package boundaries
+   - `vsp impact <object>` — what breaks if this changes?
+   - `vsp where-used <object>` — where-used with config context
+
+2. ✅ **gCTS Tools** (10 new tools) — git-enabled CTS operations
+   - List/get repositories, create/clone, pull, push, switch branch
+
+3. ✅ **Clean Core Check** — `GetAPIReleaseState` for S/4HANA compliance
+
+4. ✅ **Version History** — 3 new tools for object revision history
+
+5. ✅ **Streamable HTTP Transport** — `--transport http` for non-stdio MCP clients
+
+6. ✅ **Browser SSO Auth** — `--browser-sso` for SSO-protected systems
+
+7. ✅ **Code Coverage** — `GetCodeCoverage`, `GetCheckRunResults`
+
+8. ✅ **CDS Impact Analysis** — extended CDS tools
+
+### TODO
+
+- [ ] **Re-add ALV capture for RunReport**
+- [ ] **Try `vsp graph <package>`** — package boundary analysis on Tradebe code
+- [ ] **Try `vsp impact <object>`** — impact analysis before transports
+- [ ] **Try `vsp lint` on Tradebe ABAP packages** — quick quality check
