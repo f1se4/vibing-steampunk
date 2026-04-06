@@ -139,6 +139,8 @@ This section documents fork-specific changes for Tradebe environments.
 - **gCTS:** not available — `GctsListRepositories` returns 403 on `/sap/bc/cts_abapvcs/` (service not activated)
 - **i18n tools (group N):** available, relevant if multi-language objects exist
 - **Tip:** Add `--disabled-groups GC` to MCP config to hide the 10 gCTS tools (not usable on DS5)
+- **GetRevisions:** fully functional — returns complete version history with author, date, transport
+- **CheckBoundaries:** use `package:` param, not `object:` — auto-lookup by object name fails via BTP proxy (TADIR resolution doesn't work through the proxy layer)
 
 ### Recommended Pre-Transport Workflow (v2.37+)
 
