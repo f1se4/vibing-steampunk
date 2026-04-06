@@ -131,6 +131,27 @@ This section documents fork-specific changes for Tradebe environments.
 | `--allow-transportable-edits` | `false` | `true` |
 | `--feature-transport` | `auto` | `on` |
 
+### DS5 System Profile (tested 2026-04-06)
+
+- **System:** DS5, ABAP 7.58, non-HANA, client 100
+- **Proxy:** ADT proxy on BTP (CF eu20), auth via `--user`/`--password`
+- **Active features:** transport only (no HANA, abapGit, RAP, UI5)
+- **gCTS:** unknown — run `GctsListRepositories` after session restart to confirm
+- **i18n tools (group N):** available, relevant if multi-language objects exist
+- **Tip:** If gCTS not used on DS5, add `--disabled-groups GC` to MCP config to reduce tool noise
+
+### Recommended Pre-Transport Workflow (v2.37+)
+
+Before creating/releasing a transport, these tools provide a safety net:
+
+```
+1. CheckBoundaries  (package)     → detect cross-package Z* dependency violations
+2. GetRevisions     (type, name)  → audit who changed what and when
+3. CompareVersions  (v1, v2)      → diff two revisions before transport
+4. RunATCCheck      (package)     → code quality gate
+5. GetAPIReleaseState (object_uri) → clean core check if reusing SAP standard APIs
+```
+
 ### Build & Install
 
 ```bash
@@ -230,9 +251,11 @@ Merged ~100 commits (v2.33–v2.37) from upstream into our fork and rebased `tra
 
 8. ✅ **CDS Impact Analysis** — extended CDS tools
 
-### TODO
+### TODO (next session — restart Claude Code first to load new MCP tools)
 
-- [ ] **Re-add ALV capture for RunReport**
-- [ ] **Try `vsp graph <package>`** — package boundary analysis on Tradebe code
-- [ ] **Try `vsp impact <object>`** — impact analysis before transports
-- [ ] **Try `vsp lint` on Tradebe ABAP packages** — quick quality check
+- [ ] `GctsListRepositories` — confirm if DS5 has gCTS; if not, add `--disabled-groups GC` to MCP config
+- [ ] `CheckBoundaries` on a Tradebe package — validate package architecture
+- [ ] `GetRevisions` on a recently modified object — test version history audit
+- [ ] `GetAPIReleaseState` on a SAP standard class used by custom code — clean core check
+- [ ] `GetCodeCoverage` after `RunUnitTests` — coverage reporting
+- [ ] `vsp lint` on a Tradebe ABAP package — offline quality check, no SAP needed
