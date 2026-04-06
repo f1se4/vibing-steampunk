@@ -28,9 +28,12 @@ build: ## Build for current platform (output: /tmp/vsp_tradebe)
 	$(GO) build $(LDFLAGS) -o $(TMP_BINARY) $(CMD_DIR)
 	@echo "Built: $(TMP_BINARY)  [$(VERSION) $(COMMIT)]"
 
-install: build ## Build + install to ~/bin/vsp
+install: build ## Build + install to ~/bin/vsp (macOS: ad-hoc signed)
 	@mkdir -p $(INSTALL_DIR)
 	cp $(TMP_BINARY) $(INSTALL_DIR)/vsp
+	@if [ "$$(uname)" = "Darwin" ]; then \
+		codesign --sign - --force --preserve-metadata=entitlements $(INSTALL_DIR)/vsp 2>/dev/null && echo "Signed: $(INSTALL_DIR)/vsp (ad-hoc)" || true; \
+	fi
 	@echo "Installed: $(INSTALL_DIR)/vsp"
 	@$(INSTALL_DIR)/vsp version 2>/dev/null || $(INSTALL_DIR)/vsp --help 2>&1 | head -1 || true
 
