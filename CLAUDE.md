@@ -136,9 +136,9 @@ This section documents fork-specific changes for Tradebe environments.
 - **System:** DS5, ABAP 7.58, non-HANA, client 100
 - **Proxy:** ADT proxy on BTP (CF eu20), auth via `--user`/`--password`
 - **Active features:** transport only (no HANA, abapGit, RAP, UI5)
-- **gCTS:** unknown — run `GctsListRepositories` after session restart to confirm
+- **gCTS:** not available — `GctsListRepositories` returns 403 on `/sap/bc/cts_abapvcs/` (service not activated)
 - **i18n tools (group N):** available, relevant if multi-language objects exist
-- **Tip:** If gCTS not used on DS5, add `--disabled-groups GC` to MCP config to reduce tool noise
+- **Tip:** Add `--disabled-groups GC` to MCP config to hide the 10 gCTS tools (not usable on DS5)
 
 ### Recommended Pre-Transport Workflow (v2.37+)
 
@@ -251,11 +251,11 @@ Merged ~100 commits (v2.33–v2.37) from upstream into our fork and rebased `tra
 
 8. ✅ **CDS Impact Analysis** — extended CDS tools
 
-### TODO (next session — restart Claude Code first to load new MCP tools)
+### Tests completed (2026-04-06)
 
-- [ ] `GctsListRepositories` — confirm if DS5 has gCTS; if not, add `--disabled-groups GC` to MCP config
+- [x] `GctsListRepositories` — DS5 returns 403: gCTS service not activated → add `--disabled-groups GC`
+- [x] `GetSystemInfo` — DS5, ABAP 7.58, kernel 75I ✅
+- [x] `GetFeatures` — transport ✓, rest ✗ (confirmed) ✅
 - [ ] `CheckBoundaries` on a Tradebe package — validate package architecture
 - [ ] `GetRevisions` on a recently modified object — test version history audit
-- [ ] `GetAPIReleaseState` on a SAP standard class used by custom code — clean core check
 - [ ] `GetCodeCoverage` after `RunUnitTests` — coverage reporting
-- [ ] `vsp lint` on a Tradebe ABAP package — offline quality check, no SAP needed
