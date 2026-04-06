@@ -86,14 +86,27 @@ func (s *Server) handleCheckBoundaries(ctx context.Context, request mcp.CallTool
 
 	// Mode 2: Online — read source from SAP for a specific object
 	if objectName != "" && s.adtClient != nil {
-		source, err := s.adtClient.GetSource(ctx, "", objectName, nil)
+		// Resolve object type and package via SearchObject (needed for GetSource)
+		objPkg := pkg
+		objType := "PROG"
+		if results, err := s.adtClient.SearchObject(ctx, strings.ToUpper(objectName), 5); err == nil {
+			for _, r := range results {
+				if strings.EqualFold(r.Name, objectName) {
+					// Type may be "CLAS/OC" — take only the base type
+					t := strings.SplitN(r.Type, "/", 2)[0]
+					objType = t
+					if objPkg == "" {
+						objPkg = r.PackageName
+					}
+					break
+				}
+			}
+		}
+
+		source, err := s.adtClient.GetSource(ctx, objType, objectName, nil)
 		if err != nil {
 			return newToolResultError(fmt.Sprintf("Failed to read source for %s: %v", objectName, err)), nil
 		}
-
-		// Determine object type and package from SAP
-		objPkg := pkg
-		objType := "PROG"
 
 		nodeID := graph.NodeID(objType, objectName)
 		g.AddNode(&graph.Node{
