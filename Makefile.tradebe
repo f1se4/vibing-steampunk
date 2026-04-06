@@ -32,7 +32,7 @@ install: build ## Build + install to ~/bin/vsp
 	@mkdir -p $(INSTALL_DIR)
 	cp $(TMP_BINARY) $(INSTALL_DIR)/vsp
 	@echo "Installed: $(INSTALL_DIR)/vsp"
-	@$(INSTALL_DIR)/vsp --version 2>/dev/null || true
+	@$(INSTALL_DIR)/vsp version 2>/dev/null || $(INSTALL_DIR)/vsp --help 2>&1 | head -1 || true
 
 install-windows: ## Build Windows amd64 + deploy to /mnt/c/bin/vsp/ (WSL only)
 	GOOS=windows GOARCH=amd64 $(GO) build $(LDFLAGS) -o $(TMP_WIN_BINARY) $(CMD_DIR)
