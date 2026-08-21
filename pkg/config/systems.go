@@ -18,9 +18,26 @@ type SystemConfig struct {
 	Language string `json:"language,omitempty"`
 	Insecure bool   `json:"insecure,omitempty"`
 
+	// Optional CTS correlation attribute (for CR-level grouping, e.g. SAPTEST/ZCR)
+	TransportAttribute string `json:"transport_attribute,omitempty"`
+
+	// Optional analysis cache (opt-in)
+	Cache     bool   `json:"cache,omitempty"`      // Enable SQLite analysis cache
+	CachePath string `json:"cache_path,omitempty"` // Custom cache path (default: .vsp-cache/<system>.db)
+
 	// Cookie authentication (alternative to user/password)
 	CookieFile   string `json:"cookie_file,omitempty"`   // Path to Netscape-format cookie file
 	CookieString string `json:"cookie_string,omitempty"` // Inline cookie string
+
+	// Classic RFC (open-rfc-go) settings. The host defaults to the URL's host and
+	// the gateway port to 3300 + system number; set rfc_port to override directly.
+	// Credentials default to the RFC environment (SAP_USER/SAP_PASSWORD), then to
+	// this system's user/password.
+	RFCHost     string `json:"rfc_host,omitempty"`
+	RFCSysnr    string `json:"rfc_sysnr,omitempty"`
+	RFCPort     int    `json:"rfc_port,omitempty"`
+	RFCUser     string `json:"rfc_user,omitempty"`
+	RFCPassword string `json:"rfc_password,omitempty"`
 
 	// Optional safety settings per system
 	ReadOnly        bool     `json:"read_only,omitempty"`
@@ -41,8 +58,8 @@ type SystemsConfig struct {
 // ConfigPaths returns the list of paths to search for systems config.
 func ConfigPaths() []string {
 	paths := []string{
-		".vsp.json",                   // Current directory (preferred)
-		".vsp/systems.json",           // Current directory .vsp folder
+		".vsp.json",         // Current directory (preferred)
+		".vsp/systems.json", // Current directory .vsp folder
 	}
 
 	// Add home directory paths
@@ -106,6 +123,55 @@ func (c *SystemsConfig) GetSystem(name string) (*SystemConfig, error) {
 		}
 	}
 
+	if sys.TransportAttribute == "" {
+		envKey := fmt.Sprintf("VSP_%s_TRANSPORT_ATTRIBUTE", strings.ToUpper(name))
+		if attr := strings.TrimSpace(os.Getenv(envKey)); attr != "" {
+			sys.TransportAttribute = strings.ToUpper(attr)
+		}
+	}
+	if sys.TransportAttribute == "" {
+		if attr := strings.TrimSpace(os.Getenv("VSP_TRANSPORT_ATTRIBUTE")); attr != "" {
+			sys.TransportAttribute = strings.ToUpper(attr)
+		}
+	} else {
+		sys.TransportAttribute = strings.ToUpper(strings.TrimSpace(sys.TransportAttribute))
+	}
+
+	// Resolve RFC credentials: VSP_<SYSTEM>_RFC_PASSWORD, then the RFC
+	// environment (SAP_USER/SAP_PASSWORD) used by the open-rfc-go tooling.
+	if sys.RFCPassword == "" {
+		envKey := fmt.Sprintf("VSP_%s_RFC_PASSWORD", strings.ToUpper(name))
+		if pwd := os.Getenv(envKey); pwd != "" {
+			sys.RFCPassword = pwd
+		}
+	}
+	if sys.RFCPassword == "" {
+		if pwd := os.Getenv("SAP_PASSWORD"); pwd != "" {
+			sys.RFCPassword = pwd
+		}
+	}
+	if sys.RFCUser == "" {
+		if u := os.Getenv("SAP_USER"); u != "" {
+			sys.RFCUser = u
+		}
+	}
+
+	// Resolve cache from env if not set in config
+	if !sys.Cache {
+		envKey := fmt.Sprintf("VSP_%s_CACHE", strings.ToUpper(name))
+		if strings.EqualFold(os.Getenv(envKey), "true") {
+			sys.Cache = true
+		}
+	}
+	if !sys.Cache {
+		if strings.EqualFold(os.Getenv("VSP_CACHE"), "true") {
+			sys.Cache = true
+		}
+	}
+	if sys.Cache && sys.CachePath == "" {
+		sys.CachePath = fmt.Sprintf(".vsp-cache/%s.db", strings.ToLower(name))
+	}
+
 	// Apply defaults
 	if sys.Client == "" {
 		sys.Client = "001"
@@ -132,9 +198,11 @@ func ExampleConfig() string {
 		Default: "dev",
 		Systems: map[string]SystemConfig{
 			"dev": {
-				URL:    "http://dev.example.com:50000",
-				User:   "DEVELOPER",
-				Client: "001",
+				URL:                "http://dev.example.com:50000",
+				User:               "DEVELOPER",
+				Client:             "001",
+				TransportAttribute: "SAPTEST",
+				Cache:              true,
 			},
 			"a4h": {
 				URL:      "http://a4h.local:50000",

@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"time"
 )
 
 // HTTPDoer is an interface for executing HTTP requests.
@@ -31,6 +32,15 @@ type Transport struct {
 	// Session management
 	sessionID string
 	sessionMu sync.RWMutex
+
+	// Cookie access protection: guards config.Cookies against concurrent
+	// read (Request/retryRequest) and write (callReauthFunc) access.
+	cookiesMu sync.RWMutex
+
+	// Re-auth stampede protection: prevents concurrent 401 handlers
+	// from triggering simultaneous SAML dances.
+	reauthMu   sync.Mutex
+	lastReauth time.Time
 }
 
 // NewTransport creates a new Transport with the given configuration.
@@ -64,6 +74,12 @@ type RequestOptions struct {
 	// of the configured default. Used by i18n tools to read/write texts in
 	// specific languages without changing the global session language.
 	OverrideLanguage string
+
+	// Stateful forces this request to use stateful session mode regardless
+	// of the global default. This is required for lock→write→unlock sequences
+	// where the lock handle is bound to a specific server-side session.
+	// When set, X-sap-adt-sessiontype header is set to "stateful" for this request.
+	Stateful bool
 }
 
 // Response wraps an HTTP response with convenience methods.
@@ -105,9 +121,7 @@ func (t *Transport) Request(ctx context.Context, path string, opts *RequestOptio
 	}
 
 	// Add user-provided cookies for cookie-based authentication
-	for name, value := range t.config.Cookies {
-		req.AddCookie(&http.Cookie{Name: name, Value: value})
-	}
+	t.addCookies(req)
 
 	// Set default headers
 	t.setDefaultHeaders(req, opts)
@@ -186,10 +200,17 @@ func (t *Transport) Request(ctx context.Context, path string, opts *RequestOptio
 		if resp.StatusCode == http.StatusUnauthorized {
 			t.setCSRFToken("")
 			t.setSessionID("")
-			if err := t.fetchCSRFToken(ctx); err != nil {
-				// Return both errors: re-auth failure wraps the original 401 context
-				// so callers can see which endpoint triggered the expiry.
-				return nil, fmt.Errorf("re-authenticating after 401 on %s: %w (original error: %v)", path, err, apiErr)
+
+			if !t.config.HasBasicAuth() && t.config.ReauthFunc != nil {
+				// Cookie/SAML auth: re-run full auth dance to get fresh cookies.
+				if err := t.callReauthFunc(ctx); err != nil {
+					return nil, fmt.Errorf("re-authenticating after 401 on %s: %w (original error: %v)", path, err, apiErr)
+				}
+			} else {
+				// Basic auth: just refresh CSRF token.
+				if err := t.fetchCSRFToken(ctx); err != nil {
+					return nil, fmt.Errorf("re-authenticating after 401 on %s: %w (original error: %v)", path, err, apiErr)
+				}
 			}
 			return t.retryRequest(ctx, path, opts)
 		}
@@ -225,9 +246,7 @@ func (t *Transport) retryRequest(ctx context.Context, path string, opts *Request
 	if t.config.HasBasicAuth() {
 		req.SetBasicAuth(t.config.Username, t.config.Password)
 	}
-	for name, value := range t.config.Cookies {
-		req.AddCookie(&http.Cookie{Name: name, Value: value})
-	}
+	t.addCookies(req)
 	t.setDefaultHeaders(req, opts)
 	req.Header.Set("X-CSRF-Token", t.getCSRFToken())
 
@@ -263,62 +282,81 @@ func (t *Transport) retryRequest(ctx context.Context, path string, opts *Request
 }
 
 // fetchCSRFToken retrieves a CSRF token from the server.
-// Uses /core/discovery with HEAD for optimal performance (~25ms vs ~56s for GET on /discovery)
+//
+// HEAD on /core/discovery is the fast path (milliseconds, against tens of seconds
+// for a GET on /discovery on a slow system). Older releases — BASIS 740, ECC EhP7 —
+// answer that HEAD with 400 and no token at all, which used to make vsp unusable
+// against them, so a missing token falls back to GET. An authentication or
+// authorization failure is reported immediately: retrying cannot help.
 func (t *Transport) fetchCSRFToken(ctx context.Context) error {
-	reqURL, err := t.buildURL("/sap/bc/adt/core/discovery", nil)
+	token, status, err := t.probeCSRFToken(ctx, http.MethodHead)
 	if err != nil {
-		return fmt.Errorf("building URL: %w", err)
+		return err
 	}
-
-	// Use HEAD instead of GET for faster CSRF token fetch (~5s vs ~56s on slow systems)
-	req, err := http.NewRequestWithContext(ctx, http.MethodHead, reqURL, nil)
-	if err != nil {
-		return fmt.Errorf("creating request: %w", err)
-	}
-
-	// Set authentication
-	if t.config.HasBasicAuth() {
-		req.SetBasicAuth(t.config.Username, t.config.Password)
-	}
-	for name, value := range t.config.Cookies {
-		req.AddCookie(&http.Cookie{Name: name, Value: value})
-	}
-	req.Header.Set("X-CSRF-Token", "fetch")
-	req.Header.Set("Accept", "*/*")
-
-	// Set session type header for stateful sessions
-	if t.config.SessionType == SessionStateful {
-		req.Header.Set("X-sap-adt-sessiontype", "stateful")
-	}
-
-	resp, err := t.httpClient.Do(req)
-	if err != nil {
-		return fmt.Errorf("executing request: %w", err)
-	}
-	defer resp.Body.Close()
-
-	// Drain body to allow connection reuse
-	_, _ = io.Copy(io.Discard, resp.Body)
-
-	// Note: HEAD may return 400 but still provides CSRF token in headers
-	// But 401/403 indicates auth failure and won't have a valid token
-
-	token := resp.Header.Get("X-CSRF-Token")
-	if token == "" || token == "Required" {
-		// Provide better error message based on status code
-		switch resp.StatusCode {
+	if !isCSRFToken(token) {
+		switch status {
 		case http.StatusUnauthorized:
 			return fmt.Errorf("authentication failed (401): check username/password")
 		case http.StatusForbidden:
 			return fmt.Errorf("access forbidden (403): check user authorizations")
-		default:
-			return fmt.Errorf("no CSRF token in response (HTTP %d)", resp.StatusCode)
+		}
+		var getStatus int
+		token, getStatus, err = t.probeCSRFToken(ctx, http.MethodGet)
+		if err != nil {
+			return err
+		}
+		if !isCSRFToken(token) {
+			switch getStatus {
+			case http.StatusUnauthorized:
+				return fmt.Errorf("authentication failed (401): check username/password")
+			case http.StatusForbidden:
+				return fmt.Errorf("access forbidden (403): check user authorizations")
+			default:
+				return fmt.Errorf("no CSRF token in response (HEAD %d, GET %d)", status, getStatus)
+			}
 		}
 	}
 
 	t.setCSRFToken(token)
 	return nil
 }
+
+// probeCSRFToken asks /core/discovery for a token with the given method and
+// returns the token (empty when the server did not supply one) and the status.
+func (t *Transport) probeCSRFToken(ctx context.Context, method string) (string, int, error) {
+	reqURL, err := t.buildURL("/sap/bc/adt/core/discovery", nil)
+	if err != nil {
+		return "", 0, fmt.Errorf("building URL: %w", err)
+	}
+	req, err := http.NewRequestWithContext(ctx, method, reqURL, nil)
+	if err != nil {
+		return "", 0, fmt.Errorf("creating request: %w", err)
+	}
+
+	if t.config.HasBasicAuth() {
+		req.SetBasicAuth(t.config.Username, t.config.Password)
+	}
+	t.addCookies(req)
+	req.Header.Set("X-CSRF-Token", "fetch")
+	req.Header.Set("Accept", "*/*")
+	if t.config.SessionType == SessionStateful {
+		req.Header.Set("X-sap-adt-sessiontype", "stateful")
+	}
+
+	resp, err := t.httpClient.Do(req)
+	if err != nil {
+		return "", 0, fmt.Errorf("executing request: %w", err)
+	}
+	defer resp.Body.Close()
+	// Drain the body so the connection can be reused.
+	_, _ = io.Copy(io.Discard, resp.Body)
+
+	return resp.Header.Get("X-CSRF-Token"), resp.StatusCode, nil
+}
+
+// isCSRFToken reports whether the header value is an actual token rather than the
+// server's "Required" placeholder.
+func isCSRFToken(v string) bool { return v != "" && v != "Required" }
 
 // buildURL constructs the full URL for an API request.
 // overrideLang, if non-empty, overrides the configured session language for
@@ -382,11 +420,12 @@ func (t *Transport) setDefaultHeaders(req *http.Request, opts *RequestOptions) {
 		req.Header.Set(k, v)
 	}
 
-	// Set session header based on session type
-	switch t.config.SessionType {
-	case SessionStateful:
+	// Set session header: per-request Stateful flag overrides global default.
+	// Lock→write→unlock sequences require stateful mode to maintain session
+	// affinity for lock handles (issue #88).
+	if opts.Stateful || t.config.SessionType == SessionStateful {
 		req.Header.Set("X-sap-adt-sessiontype", "stateful")
-	default:
+	} else {
 		req.Header.Set("X-sap-adt-sessiontype", "stateless")
 	}
 }
@@ -494,4 +533,57 @@ func IsSessionExpiredError(err error) bool {
 // It refreshes the CSRF token as a side effect.
 func (t *Transport) Ping(ctx context.Context) error {
 	return t.fetchCSRFToken(ctx)
+}
+
+// reauthCooldown prevents concurrent 401 handlers from triggering simultaneous
+// SAML dances. If a re-auth completed within this window, skip the duplicate.
+const reauthCooldown = 5 * time.Second
+
+// reauthTimeout caps the total time spent in a single re-auth attempt (SAML dance +
+// CSRF fetch). Prevents concurrent 401 handlers from blocking indefinitely when the
+// re-auth holder is stuck on a slow or unresponsive IdP.
+const reauthTimeout = 30 * time.Second
+
+// callReauthFunc invokes config.ReauthFunc with stampede protection.
+// Multiple goroutines hitting 401 simultaneously will serialize through the mutex;
+// the first one performs the re-auth, subsequent ones within the cooldown window skip it.
+func (t *Transport) callReauthFunc(ctx context.Context) error {
+	t.reauthMu.Lock()
+	defer t.reauthMu.Unlock()
+
+	// Another goroutine already re-authed while we waited for the lock.
+	if !t.lastReauth.IsZero() && time.Since(t.lastReauth) < reauthCooldown {
+		return nil
+	}
+
+	// Apply a timeout so the mutex is not held indefinitely during network I/O.
+	reauthCtx, cancel := context.WithTimeout(ctx, reauthTimeout)
+	defer cancel()
+
+	cookies, err := t.config.ReauthFunc(reauthCtx)
+	if err != nil {
+		return err
+	}
+
+	t.cookiesMu.Lock()
+	t.config.Cookies = cookies
+	t.cookiesMu.Unlock()
+
+	// Fetch CSRF token with the new cookies.
+	// Set lastReauth only after CSRF succeeds — if it fails, the next
+	// goroutine should retry rather than hitting the cooldown skip.
+	if err := t.fetchCSRFToken(reauthCtx); err != nil {
+		return err
+	}
+	t.lastReauth = time.Now()
+	return nil
+}
+
+// addCookies adds user-provided cookies to a request under cookiesMu read lock.
+func (t *Transport) addCookies(req *http.Request) {
+	t.cookiesMu.RLock()
+	defer t.cookiesMu.RUnlock()
+	for name, value := range t.config.Cookies {
+		req.AddCookie(&http.Cookie{Name: name, Value: value})
+	}
 }

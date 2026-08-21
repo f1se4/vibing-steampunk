@@ -5,6 +5,9 @@
 > **ADT ↔ MCP Bridge**: Gives Claude (and other AI assistants) full access to SAP ADT APIs.
 > Read code, write code, debug, deploy, run tests — all through natural language (or DSL for automation).
 >
+> **New:** the ABAP debugger runs over classic RFC — breakpoints, attach, stepping, call stack —
+> through SAP's own ADT resources, with **nothing installed on the server** and no SAP SDK.
+>
 > See also: [OData ↔ MCP Bridge](https://github.com/oisee/odata_mcp_go) for SAP data access.
 >
 > **Want to review or test?** Start here: **[Reviewer Guide](docs/reviewer-guide.md)** — 8 hands-on tasks, no SAP needed.
@@ -13,33 +16,220 @@
 
 ## Hot Right Now
 
+### The ABAP Debugger over RFC — Nothing Installed on the Server
+
+The debugger needs one thing above all: a **stable ABAP session**.
+`attach_debuggee( )` returns an object reference, and step, stack, and variables
+all hang off it — which is why a debug loop spread over independent HTTP calls
+kept losing its debuggee. A pinned classic-RFC conversation *is* that session,
+natively, with no ICF, no CSRF, and no WebSocket upgrade.
+
+```bash
+vsp rfc debug                                    # one pinned session, held for the whole loop
+dbg> eclipse 120                                 # listen, attach, stack — through SAP's own ADT resources
+dbg> estep over
+dbg> estack
+```
+
+**Nothing is installed on the server for this.** `eclipse` drives the very
+resources Eclipse uses — `/sap/bc/adt/debugger/listeners`, `/sap/bc/adt/debugger`,
+`/sap/bc/adt/debugger/stack` — tunnelled through `SADT_REST_RFC_ENDPOINT`. The
+only reason a normal tool cannot use them is that ADT keeps the debug session in
+an ABAP roll area, reachable again only through a `sap-contextid` cookie; over a
+pinned RFC conversation the roll area *is* the session, so there is nothing to
+correlate. You get ADT's own answers back: source URIs per stack frame, DYNP
+screen frames, the authorization flags, the action catalogue — and SAP labels
+the session `RFC session: <instance>` itself.
+
+There is also a typed, smaller-payload path over a little ABAP facade
+([`abap/src/zadt_debug`](abap/src/zadt_debug/)) for systems where the ADT
+debugger resources are absent or blocked:
+
+```bash
+dbg> bp SAPLZADT_DEBUG/LZADT_DEBUGU01 9          # external breakpoint (name the include!)
+dbg> catch 150                                   # wait for a hit, attach, show the stack
+dbg> step over
+dbg> stack
+dbg> detach
+```
+
+Both paths are proven live on A4H: the breakpoint was hit by a function module
+called over a **second** RFC connection, the stack showed the real entry chain
+`%_RFC_START` → `REMOTE_FUNCTION_CALL` → the module, stepping walked it line by
+line, and afterwards the debuggee ran on and committed its work.
+
+The read half needs no ABAP either: `vsp rfc debuggees`, `vsp rfc breakpoints`
+and `vsp rfc watch` read `ABDBG_ACTIVATION` and `ABDBG_EXTDBPS` directly — who is
+parked in the debugger and where, short dumps included.
+
+The write-up, with everything that had to be learned on the way:
+[`reports/debugger-over-rfc.md`](https://github.com/oisee/open-rfc-go/blob/main/reports/debugger-over-rfc.md).
+
+### Classic RFC — Call Any Function Module, No SAP SDK
+
+vsp now speaks **classic RFC** next to ADT, through the pure-Go, SDK-free
+[open-rfc-go](https://github.com/oisee/open-rfc-go) client — no NW RFC SDK, no native
+library, no cgo. Same system, second protocol: ADT reads and writes code, RFC calls
+the business logic.
+
+```bash
+vsp rfc info                                     # RFC_SYSTEM_INFO (sysid, release, host)
+vsp rfc search 'BAPI_USER_*'                     # find RFC-enabled function modules
+vsp rfc describe STFC_STRUCTURE                  # FM interface as an MCP-tool JSON Schema
+vsp rfc call Z_DOUBLE '{"N":21}'                 # call any FM with JSON parameters
+vsp rfc read-table T000 --fields MANDT,MTEXT     # RFC_READ_TABLE
+```
+
+The destination is derived from the system you already configured: host from the ADT
+URL, system number from its port, gateway port `3300 + sysnr`. Override per system in
+`.vsp.json` (`rfc_host`, `rfc_sysnr`, `rfc_port`) or per command (`--rfc-host`,
+`--sysnr`, `--port`). RFC logon uses `rfc_user`/`rfc_password`, else `SAP_USER`/
+`SAP_PASSWORD`, else the system's own credentials.
+
+In MCP it is one more action on the single `SAP` tool — the tool space stays as small
+as it was:
+
+```
+SAP(action="rfc", params={"op":"info"})
+SAP(action="rfc", target="Z_DOUBLE", params={"op":"call","args":{"N":21}})
+SAP(action="rfc", target="STFC_CONNECTION")      # describe (default with a target)
+SAP(action="rfc", target="T000", params={"op":"read_table","fields":["MANDT"],"top":5})
+```
+
+Types are handled end to end — scalars (incl. STRING/XSTRING, DATE/TIME, packed
+DEC/TIMESTAMP, FLOAT), flat **and deep** structures and tables (xRFC) — and both the
+classic and fast serializations on the wire.
+
+And RFC does things ADT cannot:
+
+```bash
+vsp rfc probe                                    # what is this system, and what may this user do here
+vsp rfc export ZPACKAGE -o pkg.zip               # abapGit ZIP in one call
+vsp rfc run RSPARAM --wait 60 --spool            # run a report as a background job, read its spool
+vsp rfc adt GET /sap/bc/adt/discovery            # ADT REST tunnelled through RFC, for when ICF is closed
+vsp rfc debuggees                                # who is parked in the debugger, and where
+```
+
+### And the debugger is only the hard case — potentially all of ADT rides RFC
+
+`SADT_REST_RFC_ENDPOINT` takes a whole HTTP request, so **any** ADT resource is
+reachable over the gateway port: source read and write, activation, ATC, unit
+tests, transports, search, refactoring — the surface vsp already speaks, on a
+system where ICF is closed, HTTPS terminates somewhere inconvenient, or CSRF and
+cookies are a fight:
+
+```bash
+vsp rfc adt GET /sap/bc/adt/discovery                 # 200, 299 KB atomsvc
+vsp rfc adt GET /sap/bc/adt/programs/programs/RSUSR000/source/main
+vsp rfc adt POST /sap/bc/adt/atc/runs Content-Type=application/xml --body run.xml
+```
+
+Read paths are proven (discovery, program source with `ETag`/`Last-Modified`, a
+missing object answering ADT's own 404 document), and **so are the write paths**:
+
+```
+POST …/oo/classes/zcl_x?_action=LOCK&accessMode=MODIFY   → 200, a lock handle
+PUT  …/oo/classes/zcl_x/source/main?lockHandle=…         → 200   ← a separate request
+POST …/oo/classes/zcl_x?_action=UNLOCK&lockHandle=…      → 200
+POST /sap/bc/adt/activation?method=activate              → activated
+```
+
+An ADT lock is bound to an ABAP session — precisely what a short-lived HTTP
+client cannot hold, which is why `LOCK` in one call and `UPDATE_SOURCE` in the
+next fails with `InvalidLockHandle`, and why `EditSource` has to do everything
+inside a single call. A pinned RFC conversation holds exactly that session, so
+the handle is still valid on the next request.
+
+And the class used for the test is one the HTTP client **could not even lock**:
+it answers `MODIFICATION_SUPPORT=NoModification`, which is SAP saying "no
+modification assistant needed here", not "read-only". So editing over RFC is not
+merely equivalent to editing over HTTP — on that system it is strictly more
+capable. (Order matters: activate *after* unlock, or the object's own ENQUEUE
+answers `403 … is currently editing …`.)
+
+### Package Analysis Suite
+
+Five analysis commands that answer real questions about your ABAP packages:
+
+```bash
+vsp health --package '$ZDEV'                    # tests + ATC + boundaries + staleness
+vsp health --package '$ZDEV' --report html      # full HTML report with details
+vsp slim '$ZDEV' --level methods                # dead code detection (method-level)
+vsp api-surface '$ZDEV' --include-subpackages   # Clean Core: which standard APIs do you use?
+vsp boundaries '$ZDEV'                          # directional boundary crossing analysis
+vsp boundaries '$ZDEV' --format mermaid         # visual graph with package subgraphs
+```
+
+### Transport & Change History
+
+```bash
+vsp changelog '$ZDEV' --since 20260101          # what changed in this package?
+vsp changes '$ZDEV' --attribute SAPTEST         # group transports by CR attribute (E070A)
+```
+
+### Directional Boundary Crossings
+
+Not just "crossed" or "not crossed" — **which direction** the dependency flows:
+
+| Direction | Meaning | Verdict |
+|-----------|---------|---------|
+| UPWARD | child → parent | OK |
+| COMMON | anything → _00 package | OK |
+| SIBLING | module → module | BAD — extract to common |
+| DOWNWARD | parent → child | BAD — inverts hierarchy |
+| EXTERNAL | cross-hierarchy | WARN — isolation violation |
+| CIRCULAR | A→B + B→A siblings | BAD — coupled modules |
+
+Export to 7 formats: `text`, `json`, `md`, `mermaid`, `html`, `dot` (Graphviz), `plantuml`, `graphml` (Gephi/yEd).
+
+### Side Effect & LUW Analysis
+
+The parser detects transactional patterns in ABAP source:
+
+| What | Detected |
+|------|----------|
+| DB read/write | SELECT, INSERT, UPDATE, DELETE, MODIFY |
+| LUW ownership | COMMIT WORK, ROLLBACK WORK |
+| Deferred execution | IN UPDATE TASK, IN BACKGROUND TASK |
+| Async | STARTING NEW TASK (aRFC), SUBMIT VIA JOB |
+| External calls | RFC DESTINATION, HTTP client, APC/WebSocket |
+| Transactions | CALL TRANSACTION, LEAVE TO TRANSACTION |
+| Transformations | CALL TRANSFORMATION |
+
+LUW classification: **safe** / **participant** / **owner** / **unsafe**.
+
+### Health Reports
+
+Full health reports with test details, ATC findings, and boundary crossings:
+
+```bash
+vsp health --package '$ZDEV' --details          # text with all details
+vsp health --package '$ZDEV' --report md        # → _ZDEV.md
+vsp health --package '$ZDEV' --report html      # → _ZDEV.html
+vsp health --package '$ZDEV' --report my.html   # → my.html
+```
+
+Tests discover embedded local test classes across the full package hierarchy — the same as Eclipse Ctrl+Shift+F10.
+
+### More
+
 - `vsp graph co-change CLAS ZCL_FOO` for transport-based co-change analysis
-- `SAP(action="analyze", params={"type":"co_change", ...})` for MCP co-change
-- `SAP(action="analyze", params={"type":"impact", ...})` for reverse dependency impact
+- `vsp graph where-used-config ZKEKEKE` for heuristic TVARVC usage discovery
+- `.vsp.json` `transport_attribute` for per-system CR correlation config
+- **[Analysis & Refactoring Guide](docs/analysis-refactoring-guide.md)** for what these commands do
 - **[Graph Guide](docs/graph-guide.md)** for examples, data sources, and current limits
 
-## 100 Stars!
+## 0x101 Stars!
 
-Read the milestone article: **[Agentic ABAP at 100 Stars: The Numbers, The Community, and What's Cooking](articles/2026-02-18-100-stars-celebration.md)**
+Read the latest article: **[VSP IS ONLY 5% EXPLORED](articles/2026-04-07-vsp-only-5-percent-explored.md)** — 257 stars, 147 tools, compilers, graph analysis, and why 95% of the surface is still unexplored.
 
-## What's New — Token Efficiency Sprint
+Previous: **[Agentic ABAP at 100 Stars](articles/2026-02-18-100-stars-celebration.md)**
 
-> **Sprint goal:** make every token count. Built-in ABAP understanding, compressed dependency context, and a single-tool mode that opens the door for local/small models.
+## What's New — Analysis & Intelligence Sprint
+
+> **Sprint goal:** move from CRUD tool to ABAP intelligence platform. Package-level analysis, directional boundary crossings, side effect detection, transport correlation.
 
 The full version history is in [CHANGELOG.md](CHANGELOG.md).
-
-### Graph MVP — New Dependency Analysis Surfaces
-
-VSP now has a first graph-MVP layer for questions that are bigger than grep and different from a plain call graph:
-
-- `vsp graph co-change CLAS ZCL_FOO`
-  Transport-based co-change: what usually moves together with this object?
-- `SAP(action="analyze", params={"type":"co_change","object_type":"CLAS","object_name":"ZCL_FOO"})`
-  The same co-change analysis over MCP.
-- `SAP(action="analyze", params={"type":"impact","object_type":"CLAS","object_name":"ZCL_FOO","max_depth":3})`
-  Reverse dependency impact: who statically depends on this object?
-
-This is the start of a graph-oriented analysis layer, not just another call-tree view. See **[Graph Guide](docs/graph-guide.md)** for examples, data sources, and current limitations.
 
 ### Hyperfocused Mode — 1 Tool to Rule Them All (Recommended)
 
@@ -181,22 +371,55 @@ Compile WebAssembly binaries to native ABAP — advanced prototype, verified on 
 
 ### Full CLI Toolchain — SAP from the Terminal
 
-28 commands. No SAP GUI, no Eclipse, no IDE. Most work with standard ADT; `lint`/`parse`/`compile` work fully offline.
+35+ commands. No SAP GUI, no Eclipse, no IDE. Most work with standard ADT; `lint`/`parse`/`compile` work fully offline.
 
 ```bash
-vsp query T000 --top 5                           # query tables
-vsp grep "SELECT.*mara" --package '$TMP'          # search source code
-vsp graph CLAS ZCL_FOO --direction callers        # who uses this class?
-vsp graph co-change CLAS ZCL_FOO                  # what changes together with this object?
-vsp deps '$ZFINANCE' --format summary             # transport readiness check
-vsp lint --file myclass.clas.abap                 # offline ABAP linter
-vsp compile wasm program.wasm --class ZCL_DEMO    # WASM→ABAP compiler
-vsp parse --stdin --format json < source.abap     # ABAP parser
-vsp context CLAS ZCL_FOO --depth 2                # compressed deps (2 levels)
-vsp system info                                   # system version + ZADT_VSP check
-```
+# Package analysis
+vsp health --package '$ZDEV'                     # tests + ATC + boundaries + staleness
+vsp health --package '$ZDEV' --report html       # full HTML report
+vsp slim '$ZDEV' --level methods                 # dead code detection
+vsp api-surface '$ZDEV' --include-subpackages    # Clean Core API inventory
+vsp boundaries '$ZDEV' --format mermaid          # boundary crossings (visual)
+vsp boundaries '$ZDEV' --report dot              # Graphviz export
+vsp changelog '$ZDEV' --since 20260101           # transport history
+vsp changes '$ZDEV' --attribute SAPTEST          # CR-level grouping
 
-`graph` now covers both classic call-graph inspection and the first graph-MVP query slices. Call-graph paths use ADT first with WBCROSSGT/CROSS fallback; graph-MVP analysis currently adds transport-based co-change and MCP impact analysis on top of the new `pkg/graph` layer.
+# Graph & dependencies
+vsp graph CLAS ZCL_FOO --direction callers       # who uses this class?
+vsp graph co-change CLAS ZCL_FOO                 # transport-based co-change
+vsp graph where-used-config ZKEKEKE              # TVARVC readers (heuristic)
+
+# Source & editing
+vsp source CLAS ZCL_MY_CLASS                     # read source
+vsp source CLAS ZCL_MY_CLASS --method GET_DATA   # read single method
+vsp context CLAS ZCL_FOO --depth 2               # source + dependency contracts
+vsp analyze ZCL_MY_CLASS                         # 13 lint rules (offline)
+
+# Classic RFC (no SAP SDK)
+vsp rfc info                                     # RFC system info
+vsp rfc call Z_DOUBLE '{"N":21}'                 # call any function module
+vsp rfc describe BAPI_USER_GET_DETAIL            # FM interface as JSON Schema
+
+# Tables & search
+vsp query T000 --top 5                           # query any table
+vsp search "ZCL_*" --type CLAS --max 50          # object search
+vsp grep "SELECT.*mara" --package '$TMP'         # source code search
+
+# Testing & quality
+vsp test --package '$ZDEV'                       # run unit tests
+vsp atc CLAS ZCL_MY_CLASS                        # ATC code check
+
+# Deployment & tooling
+vsp deploy zcl_test.clas.abap '$TMP'             # deploy file to SAP
+vsp export '$ZORK' '$ZLLM' -o packages.zip       # export abapGit ZIP
+vsp install abapgit                              # install abapGit on SAP
+vsp install zadt-vsp                             # install ZADT_VSP handler
+
+# Offline tools
+vsp lint --file myclass.clas.abap                # offline ABAP linter
+vsp parse --stdin --format json < source.abap    # ABAP parser
+vsp compile wasm program.wasm --class ZCL_DEMO   # WASM→ABAP compiler
+```
 
 See **[CLI Guide](docs/cli-guide.md)** for the complete reference with feature requirements matrix.
 
@@ -207,22 +430,28 @@ See **[CLI Guide](docs/cli-guide.md)** for the complete reference with feature r
 
 ## Key Features
 
+- **Classic RFC without the SAP SDK** — `vsp rfc` and the `rfc` action of the `SAP` MCP
+  tool call any RFC-enabled function module over the gateway, in pure Go.
+
 | Feature | Description |
 |---------|-------------|
-| **Hyperfocused Mode** | `--mode hyperfocused` (recommended): 1 universal SAP tool, **~200 tokens** vs ~40K for 147 |
+| **Package Health** | `vsp health` — tests, ATC, boundary crossings, staleness in one report (text/md/html) |
+| **Dead Code Detection** | `vsp slim` — method-level dead/internal/live classification via WBCROSSGT reverse refs |
+| **Boundary Analysis** | `vsp boundaries` — directional crossings (UPWARD/SIBLING/DOWNWARD/EXTERNAL/CIRCULAR) |
+| **Side Effect Detection** | DB read/write, COMMIT/ROLLBACK, UPDATE TASK, RFC, async — LUW classification |
+| **Transport History** | `vsp changelog` + `vsp changes` — transport correlation and CR-level grouping |
+| **API Surface** | `vsp api-surface` — Clean Core inventory: which standard APIs does your code use? |
+| **Graph Export** | 7 formats: mermaid, HTML, DOT (Graphviz), PlantUML, GraphML (Gephi), JSON, MD |
+| **Static Analysis** | `vsp analyze` — 13 lint rules in pure Go, no external dependencies |
+| **Hyperfocused Mode** | 1 universal SAP tool, **~200 tokens** vs ~40K for 147 tools |
 | **Context Compression** | Auto-compressed dependency contracts — 7–30x compression, built-in ABAP parser |
+| **Method-Level Surgery** | Read/edit individual methods — 95% token reduction vs full-class round-trips |
 | **ABAP LSP** | Built-in Language Server — real-time diagnostics, go-to-definition, context push |
 | **AI Debugger** | Breakpoints, listener, attach, step, inspect stack & variables |
 | **RAP OData E2E** | Create CDS views, Service Definitions, Bindings → Publish OData services |
-| **Focused Mode** | 100 curated tools optimized for AI assistants |
 | **AI-Powered RCA** | Root cause analysis with dumps, traces, profiler + code intelligence |
 | **DSL & Workflows** | Fluent Go API + YAML automation for CI/CD pipelines |
-| **ExecuteABAP** | Run arbitrary ABAP code via unit test wrapper |
-| **Code Analysis** | Call graphs, object structure, find definition/references |
-| **Dependency Analysis** | Call graphs, package boundary checks, dynamic call detection (in progress) |
-| **System Introspection** | System info, installed components, CDS dependencies |
-| **Diagnostics** | Short dumps (RABAX), ABAP profiler (ATRA), SQL traces (ST05) |
-| **File Deployment** | Bypass token limits - deploy large files directly from filesystem |
+| **File Deployment** | Bypass token limits — deploy large files directly from filesystem |
 | **Surgical Edits** | `EditSource` tool matches Claude's Edit pattern for precise changes |
 
 ## Quick Start
@@ -342,6 +571,8 @@ vsp -s dev search "Z*ORDER*" --type CLAS --max 50
 vsp -s a4h graph CLAS ZCL_FOO                      # call graph
 vsp -s a4h graph co-change CLAS ZCL_FOO           # transport-based co-change
 vsp -s a4h graph co-change PROG ZREPORT --format json
+vsp -s a4h graph where-used-config ZKEKEKE        # TVARVC readers (heuristic)
+vsp -s a4h graph where-used-config ZKEKEKE --format mermaid > config.mmd
 
 # Testing & code quality
 vsp -s a4h test CLAS ZCL_MY_CLASS                 # run unit tests
@@ -373,8 +604,10 @@ vsp lsp --stdio
 Graph-MVP highlights:
 
 - `vsp graph co-change <type> <name>` for transport-based co-change analysis
+- `vsp graph where-used-config <variable>` for heuristic TVARVC usage analysis
 - `SAP(action="analyze", params={"type":"co_change", ...})` for MCP co-change
 - `SAP(action="analyze", params={"type":"impact", ...})` for reverse dependency impact
+- `SAP(action="analyze", params={"type":"where_used_config", ...})` for MCP TVARVC usage
 
 ### System Profiles (`.vsp.json`)
 

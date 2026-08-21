@@ -1,8 +1,6 @@
 module github.com/oisee/vibing-steampunk
 
-go 1.24.0
-
-toolchain go1.24.10
+go 1.26
 
 require (
 	github.com/chromedp/cdproto v0.0.0-20250803210736-d308e07a266d
@@ -11,10 +9,12 @@ require (
 	github.com/joho/godotenv v1.5.1
 	github.com/mark3labs/mcp-go v0.47.0
 	github.com/mattn/go-sqlite3 v1.14.32
+	github.com/oisee/open-rfc-go v0.0.0-20260820234724-6ef4d9eeb9cd
 	github.com/spf13/cobra v1.10.1
 	github.com/spf13/viper v1.21.0
 	github.com/tetratelabs/wazero v1.11.0
 	github.com/yuin/gopher-lua v1.1.1
+	golang.org/x/net v0.52.0
 	gopkg.in/yaml.v3 v3.0.1
 )
 
@@ -38,6 +38,6 @@ require (
 	github.com/subosito/gotenv v1.6.0 // indirect
 	github.com/yosida95/uritemplate/v3 v3.0.2 // indirect
 	go.yaml.in/yaml/v3 v3.0.4 // indirect
-	golang.org/x/sys v0.38.0 // indirect
-	golang.org/x/text v0.28.0 // indirect
+	golang.org/x/sys v0.42.0 // indirect
+	golang.org/x/text v0.35.0 // indirect
 )

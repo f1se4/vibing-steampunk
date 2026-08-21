@@ -1106,6 +1106,37 @@ func (s *Server) registerCRUDTools(shouldRegister func(string) bool) {
 		), s.handleDeleteObject)
 	}
 
+	if shouldRegister("RecoverFailedCreate") {
+		s.mcpServer.AddTool(mcp.NewTool("RecoverFailedCreate",
+			mcp.WithDescription("Recover a zombie object left behind by an earlier failed CreateObject. "+
+				"Probes whether SAP currently persists the object; if yes, runs best-effort compensating "+
+				"cleanup (lock release, fresh-session lock acquisition, DeleteObject); if no, returns an "+
+				"idempotent no-op. Does NOT require a lock_handle from the original session — the handler "+
+				"acquires its own. Returns a structured report with status, attempted cleanup actions, "+
+				"and residual manual steps if cleanup could not finish. "+
+				"Use this when a CreateObject call returned a 5xx error and you cannot edit / delete the "+
+				"object through normal MCP flows because the old lock handle is gone."),
+			mcp.WithString("object_type",
+				mcp.Required(),
+				mcp.Description("ABAP object type (CLAS, PROG, INTF, FUGR, DDLS, FUNC, ...)"),
+			),
+			mcp.WithString("name",
+				mcp.Required(),
+				mcp.Description("Object name"),
+			),
+			mcp.WithString("package_name",
+				mcp.Required(),
+				mcp.Description("Package — used by the safety gate; must be in the configured allowed list"),
+			),
+			mcp.WithString("parent_name",
+				mcp.Description("Parent function group name (required for FUNC / LIMU FUNC recovery)"),
+			),
+			mcp.WithString("transport",
+				mcp.Description("Transport request the zombie object was attached to, if any"),
+			),
+		), s.handleRecoverFailedCreate)
+	}
+
 	// Transport-related tools
 	if shouldRegister("GetUserTransports") {
 		s.mcpServer.AddTool(mcp.NewTool("GetUserTransports",
@@ -2239,6 +2270,21 @@ func (s *Server) registerTestingQualityTools(shouldRegister func(string) bool) {
 			),
 		), s.handleGetCheckRunResults)
 	}
+
+	if shouldRegister("AnalyzeABAPCode") {
+		s.mcpServer.AddTool(mcp.NewTool("AnalyzeABAPCode",
+			mcp.WithDescription("Analyze ABAP source code for quality, performance, security, and robustness issues using the native Go abaplint engine. Provide source directly or specify object_type + object_name to fetch from SAP. Returns findings with severity, category, line numbers, and fix suggestions."),
+			mcp.WithString("object_type",
+				mcp.Description("ADT object type (e.g., PROG, CLAS, FUGR) — required when using object_name"),
+			),
+			mcp.WithString("object_name",
+				mcp.Description("ABAP object name (e.g., ZTEST, ZCL_MY_CLASS) — fetches source from SAP"),
+			),
+			mcp.WithString("source",
+				mcp.Description("ABAP source code to analyze directly (alternative to object_name)"),
+			),
+		), s.handleAnalyzeABAPCode)
+	}
 }
 
 // registerI18NTools registers i18n/translation tools.
@@ -2302,6 +2348,18 @@ func (s *Server) registerI18NTools(shouldRegister func(string) bool) {
 			),
 			mcp.WithString("transport",
 				mcp.Description("Transport request number (optional for $TMP objects)"),
+			),
+			mcp.WithArray("texts",
+				mcp.Required(),
+				mcp.Description(`Messages to write: [{"number":"001","text":"Order & created"}]`),
+				mcp.Items(map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"number": map[string]any{"type": "string", "description": "Three-digit message number"},
+						"text":   map[string]any{"type": "string", "description": "Message text for this language"},
+					},
+					"required": []string{"number", "text"},
+				}),
 			),
 		), s.handleWriteMessageClassTexts)
 	}
