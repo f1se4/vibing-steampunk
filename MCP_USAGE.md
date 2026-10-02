@@ -122,6 +122,23 @@ flowchart TD
 
 ---
 
+### Transports
+
+`GetUserTransports` / `ListTransports` (hyperfocused: `SAP(action="system", params={"type": "get_user_transports" | "list_transports", ...})`) read the transport organizer tree, `GET /sap/bc/adt/cts/transportrequests`. Defaults: `request_type` `KWT` (workbench, customizing, transport of copies), `request_status` `DR` (modifiable and released), `targets` true, `source` `auto`.
+
+Why the defaults matter: without `requestStatus` the organizer answers with released requests of the last two weeks only, so a listing that sends the user alone looks empty of modifiable transports. Always let vsp send both parameters, or set them yourself.
+
+`source` selects where the listing comes from:
+
+| source | behaviour |
+|---|---|
+| `auto` (default) | organizer tree with explicit parameters, then the saved search configuration, then E070/E07T — the first source with requests wins; the answer names it and lists every fallback in `notes` |
+| `params` | organizer tree with explicit parameters only |
+| `config` | organizer tree through the saved Transport Organizer search configuration, as Eclipse does; the configuration decides the filters and the user (`config_uri` picks one explicitly) |
+| `sql` | E070/E07T directly; the only source for user `*` |
+
+`released_from`/`released_to` (YYYYMMDD) widen the released window. Each request carries `bucket` (`modifiable`/`released`) and, when the tree groups by target, `project`.
+
 ## Tool Selection Decision Tree
 
 ```mermaid
@@ -192,6 +209,30 @@ flowchart LR
 | Create new | `WriteSource(mode=create)` | Explicit create |
 | Update existing | `WriteSource(mode=update)` | Explicit update |
 | Deploy large file | `ImportFromFile` | Bypasses token limits |
+
+### Guarded updates with source hashes
+
+For a write that must not overwrite another editor's change, first request a
+structured read with `include_hash=true`. Pass its `sourceHash` back as
+`expected_source_hash` to `WriteSource`, `EditSource`, `ImportFromFile`, or
+`DeployFromFile`. VSP takes the MODIFY lock, re-reads the locked source, and
+refuses the write with `SOURCE_DRIFT` if it differs. After a guarded write is
+activated it returns `targetSourceHash` and `verifiedSourceHash`; a failed
+read-back is an uncertain outcome, so inspect SAP rather than retry blindly.
+
+```json
+// Read: returns { source, sourceHash, context? }
+{ "object_type": "CLAS", "name": "ZCL_ORDER", "include_hash": true }
+
+// Write only the version just read
+{
+  "object_type": "CLAS",
+  "name": "ZCL_ORDER",
+  "source": "CLASS zcl_order IMPLEMENTATION.\nENDCLASS.",
+  "mode": "update",
+  "expected_source_hash": "sha256:..."
+}
+```
 
 ### Searching
 
@@ -498,8 +539,48 @@ SAP(action="rfc", target="BAPI_USER_*", params={"op":"search"})
 SAP(action="rfc", target="STFC_CONNECTION")                describe (default with a target)
 SAP(action="rfc", target="Z_DOUBLE", params={"op":"call","args":{"N":21}})
 SAP(action="rfc", target="T000", params={"op":"read_table","fields":["MANDT"],"top":5})
+SAP(action="rfc", target="ZREPORT", params={"op":"run","variant":"DEFAULT"})   background job: status, spool, job log
+SAP(action="rfc", target="VSP_ZREPORT", params={"op":"job","job_count":"12345678"})   a job still running after "wait"
 ```
 
-Ops: `info`, `ping`, `describe`, `call`, `search`, `read_table`. Destination overrides
-in `params`: `host`, `sysnr`, `port`, `user` — otherwise the host and system number
-come from the configured ADT URL and the gateway is `3300 + sysnr`.
+Ops: `info`, `ping`, `describe`, `call`, `search`, `read_table`, `run`, `job`. `run`
+takes `variant`, `params` (`{"P_WERKS":"1000","S_MATNR":["M1","M2"]}` or RSPARAMS
+rows), `wait` (seconds, default 60, at most 300), `job_name`, and `spool`/`joblog`
+(both default true). The gateway is the server's own: the host and system number
+come from the system's `.vsp.json` entry (`rfc_host`, `rfc_sysnr`, `rfc_port`) or
+from the configured ADT URL, with the port `3300 + sysnr`. A per-call `host`,
+`sysnr` or `port` that points anywhere else is refused, because the configured
+credentials would go with it; `user` picks the logon. Under `--read-only`, `call`
+and `run` are refused.
+
+### IDocs (`read IDOC`)
+
+An IDoc's segment data sits in `EDID4-SDATA`, an LRAW field that neither the data
+preview nor `RFC_READ_TABLE` can select, and `IDOC_READ_COMPLETELY` is not
+remote-enabled. `read IDOC` goes through the EDI document API over RFC instead:
+`EDI_DOCUMENT_OPEN_FOR_READ`, `EDI_SEGMENTS_GET_ALL` and
+`EDI_DOCUMENT_READ_ALL_STATUS`, on one connection.
+
+```
+SAP(action="read", target="IDOC 28757955")
+SAP(action="read", target="IDOC 28757955", params={"segment":"E1EDKA1"})
+```
+
+The result carries three parts:
+
+- the control record;
+- the status records, newest first, each with the meaning of its code (TEDS2) and
+  its message text with the parameters filled in (T100 where EDIDS keeps only the
+  message);
+- the segments with their fields.
+
+Segments are cut into fields by the layout of the basic type and its extension
+(`IDOCTYPE_READ_COMPLETE`). A segment the type does not list gets its layout from
+`SEGMENT_READ_COMPLETE`; if that fails too, its raw `data` is returned.
+
+Parameters:
+
+- `segment` keeps only segment types starting with that prefix;
+- `all_fields` also returns fields that are empty;
+- `raw` returns SDATA without cutting it into fields;
+- `max_segments` limits the number of segments (default 500).

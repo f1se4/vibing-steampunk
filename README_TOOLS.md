@@ -21,6 +21,8 @@ These tools replace 11 granular read/write operations with intelligent parameter
 
 **RAP Support (NEW):** WriteSource now supports creating and updating CDS views (DDLS), behavior definitions (BDEF), and service definitions (SRVD).
 
+**Guarded updates:** Call `GetSource(include_hash=true)` to receive `{source, sourceHash}`. Supply that hash as `expected_source_hash` to `WriteSource`, `EditSource`, `ImportFromFile`, or `DeployFromFile`; VSP checks it again after acquiring the write lock and rejects `SOURCE_DRIFT` rather than overwriting another editor's work. Guarded successes include the requested target and verified read-back hashes.
+
 ---
 
 ## Search & Grep Tools (4 tools)
@@ -76,11 +78,11 @@ These tools replace 11 granular read/write operations with intelligent parameter
 
 | Tool | Description | Mode |
 |------|-------------|------|
-| `GetCallGraph` | Get call hierarchy (callers/callees) for methods/functions | Focused |
+| `GetCallGraph` | Who uses this object and what it uses, one hop, from the where-used list and the cross-reference tables | Focused |
 | `GetObjectStructure` | Get object explorer tree structure | Focused |
-| `GetCallersOf` | Get who calls this object (static call graph - up traversal) | Expert |
-| `GetCalleesOf` | Get what this object calls (static call graph - down traversal) | Expert |
-| `AnalyzeCallGraph` | Get statistics about call graph (nodes, edges, depth, types) | Expert |
+| `GetCallersOf` | Who references this object, from the where-used list behind SE84 | Expert |
+| `GetCalleesOf` | What this object's code reaches, from the CROSS and WBCROSSGT tables (references recorded at activation, not observed calls; needs free SQL) | Expert |
+| `AnalyzeCallGraph` | Counts over one object's references: how many, of what kind, in which direction | Expert |
 | `CompareCallGraphs` | Compare static vs actual execution for test coverage analysis | Expert |
 | `TraceExecution` | **COMPOSITE RCA TOOL**: Static graph + trace + comparison for root cause analysis | Expert |
 
@@ -192,15 +194,18 @@ Solves token limit problem for large files:
 | `SaveToFile` | Legacy name for ExportToFile | Expert |
 | `RenameObject` | Rename object by creating copy | Expert |
 
-**Supported Extensions:**
-- `.clas.abap` - Classes
-- `.prog.abap` - Programs
+**Supported Extensions** (matched without regard to case):
+- `.clas.abap` - Classes (plus `.clas.testclasses.abap`, `.clas.locals_def.abap`, `.clas.locals_imp.abap`, `.clas.macros.abap`)
+- `.prog.abap` - Programs. When the `.prog.xml` abapGit writes beside it says `<SUBC>I</SUBC>`, it is the include named for the file (abapGit keeps includes this way); otherwise it must open with `REPORT`/`PROGRAM` naming the file's program.
+- `.incl.abap` - Includes (ExportToFile writes includes with this suffix)
 - `.intf.abap` - Interfaces
 - `.fugr.abap` - Function Groups
-- `.func.abap` - Function Modules
+- `{group}.fugr.{module}.abap` - Function Modules, abapGit's name (ExportToFile writes this when the group is known). `{group}.fugr.{module}.func.abap` and `{module}.func.abap` are still read; without the group in the name, a module cannot be deployed.
 - `.ddls.asddls` - CDS DDL Sources (ABAPGit format)
 - `.bdef.asbdef` - Behavior Definitions (ABAPGit format)
 - `.srvd.srvdsrv` - Service Definitions (ABAPGit format)
+- A typed file's object is always the one in its file name (`#` stands for `/`), never the one in its content. A file whose main statement names another object is refused rather than deployed under either name: `zrep_top.prog.abap` holding `PROGRAM zrep.` does not overwrite `ZREP`. In a `.clas.abap`/`.intf.abap`, `DEFERRED`, `LOAD` and local (non-`PUBLIC`) declarations before the global one are passed over.
+- Plain `{name}.abap` - typed from its first statement, only when that statement names `{name}` itself (`REPORT zfoo.` in `zfoo.abap`). A class or interface must be declared `PUBLIC`. A file with no such statement is read as include `{name}`, which is how older exports wrote includes. Anything else, such as a TOP include that opens with its main program's `PROGRAM` statement, is refused with a message saying how to rename it.
 
 ---
 
@@ -225,7 +230,7 @@ Solves token limit problem for large files:
 | `CreateTransport` | Create transport request | Expert |
 | `GetTransportInfo` | Get transport details | Expert |
 | `ReleaseTransport` | Release transport | Expert |
-| `GetUserTransports` | List user's transports | Expert |
+| `GetUserTransports` | List a user's transports: workbench/customizing, modifiable/released, grouped by target and CTS project. Parameters `request_type` (KWT), `request_status` (DR), `released_from`/`released_to`, `targets`, `source` (auto/params/config/sql), `config_uri` | Expert |
 | `GetInactiveObjects` | List inactive objects | Expert |
 
 ---
@@ -251,13 +256,27 @@ See [ExecuteABAP Implementation Report](reports/2025-12-05-004-execute-abap-impl
 
 | Tool | Description | Mode |
 |------|-------------|------|
-| `GetDumps` | List runtime errors with filters (user, exception type, program, date range) | Focused |
-| `GetDump` | Get full details of a specific dump including stack trace | Focused |
+| `ListDumps` | List runtime errors with filters (error type, program, user, date range) | Focused |
+| `GetDump` | One dump in detail: header, termination point, application component, call stack | Focused |
 
 **Use Cases:**
 - Monitor system health by checking recent dumps
 - Debug production issues by examining dump details
-- Track error patterns by exception type
+- Track error patterns by error type
+
+**The rest of the post-mortem lives on the universal tool** (hyperfocused mode),
+because it is a set of questions about a dump rather than more tools:
+
+```
+SAP(action="analyze", params={"type": "group_dumps"})       what keeps failing, not what failed once
+SAP(action="analyze", params={"type": "explain_dump"})      the stack, plus the application log ranked by argument
+SAP(action="analyze", params={"type": "similar_dumps"})     is this new, and how often
+SAP(action="analyze", params={"type": "dump_impact"})       who else reaches the code that failed
+SAP(action="analyze", params={"type": "application_log"})   SLG1 headers by program, user, log object; messages=true decodes BALDAT
+SAP(action="analyze", params={"type": "cluster_read"})      any cluster table (BALDAT, INDX, STXL) decoded: objects, typed fields, rows
+```
+
+The same ground the CLI covers with `vsp dumps`, `vsp applog` and `vsp cluster`.
 
 ---
 
@@ -316,14 +335,13 @@ src/
 
 ---
 
-## Install/Setup Tools (3 tools) - NEW v2.17.0
+## Install/Setup Tools - NEW v2.17.0
 
 Deploy VSP components and dependencies to SAP systems via ADT.
 
 | Tool | Description | Mode |
 |------|-------------|------|
 | `InstallZADTVSP` | Deploy ZADT_VSP WebSocket handler (6 ABAP objects) | Focused |
-| `InstallAbapGit` | Deploy abapGit from embedded ZIP (standalone or dev edition) | Focused |
 | `ListDependencies` | List available dependencies for installation | Focused |
 
 **InstallZADTVSP Parameters:**
@@ -331,10 +349,8 @@ Deploy VSP components and dependencies to SAP systems via ADT.
 - `skip_git_service` - Skip Git service if no abapGit (default: auto-detected)
 - `check_only` - Only check prerequisites, don't deploy
 
-**InstallAbapGit Parameters:**
-- `edition` - `standalone` (single program) or `dev` (full packages)
-- `package` - Target package (default: `$ABAPGIT` or `$ZGIT_DEV`)
-- `check_only` - Only show deployment plan
+**abapGit:** install is CLI-only (standalone edition) for now: `vsp install abapgit --edition standalone`.
+The MCP install tool is being rebuilt (#277); the developer edition is not installable yet.
 
 **Architecture:**
 ```
@@ -345,8 +361,8 @@ embedded/
 │   └── embed.go
 │
 └── deps/           # Dependencies (abapGit ZIP format)
-    ├── abapgit-standalone.zip  # Placeholder
-    ├── abapgit-dev.zip         # Placeholder
+    ├── abapgit-standalone.zip  # Embedded standalone ZABAPGIT
+    ├── abapgit-full.zip        # Empty placeholder (#277)
     └── embed.go                # Unzip + deploy logic
 ```
 

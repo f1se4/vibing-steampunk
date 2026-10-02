@@ -205,8 +205,8 @@ func parseUsageReferences(data []byte) ([]UsageReference, error) {
 func extractTypeFromURI(uri string) string {
 	// Common patterns: /sap/bc/adt/oo/classes/..., /sap/bc/adt/programs/programs/...
 	patterns := map[string]string{
-		"/oo/classes/":      "CLAS/OC",
-		"/oo/interfaces/":   "INTF/OI",
+		"/oo/classes/":       "CLAS/OC",
+		"/oo/interfaces/":    "INTF/OI",
 		"/programs/programs": "PROG/P",
 		"/programs/includes": "PROG/I",
 		"/functions/groups/": "FUGR/F",
@@ -390,6 +390,11 @@ func parsePrettyPrinterSettings(data []byte) (*PrettyPrinterSettings, error) {
 
 // SetPrettyPrinterSettings updates the formatter settings.
 func (c *Client) SetPrettyPrinterSettings(ctx context.Context, settings *PrettyPrinterSettings) error {
+	// The settings are stored on the system for the user: a write, refused
+	// under --read-only before any request.
+	if err := c.checkSafety(OpUpdate, "SetPrettyPrinterSettings"); err != nil {
+		return err
+	}
 	body := fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
 <prettyprintersettings:PrettyPrinterSettings
 xmlns:prettyprintersettings="http://www.sap.com/adt/prettyprintersettings"

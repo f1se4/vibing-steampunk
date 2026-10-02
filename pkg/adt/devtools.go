@@ -30,6 +30,16 @@ type SyntaxCheckResult struct {
 // pass the include URL directly - no /source/main suffix will be added.
 // content is the source code to check
 func (c *Client) SyntaxCheck(ctx context.Context, objectURL string, content string) ([]SyntaxCheckResult, error) {
+	body, err := c.postCheckRun(ctx, objectURL, content)
+	if err != nil {
+		return nil, fmt.Errorf("syntax check failed: %w", err)
+	}
+	return parseSyntaxCheckResults(body)
+}
+
+// postCheckRun sends content to the ABAP check run for objectURL and returns
+// SAP's answer. The content is checked, not saved.
+func (c *Client) postCheckRun(ctx context.Context, objectURL string, content string) ([]byte, error) {
 	// Build the request body
 	// The checkObject URI identifies the object being checked (no /source/main needed).
 	// The artifact URI identifies the source location:
@@ -39,7 +49,10 @@ func (c *Client) SyntaxCheck(ctx context.Context, objectURL string, content stri
 	// SAP's URI length limit for long namespaced classes.
 	checkObjectURI := objectURL
 	artifactURI := objectURL
-	if !strings.Contains(objectURL, "/includes/") {
+	// Class includes (/oo/classes/ZCL_FOO/includes/testclasses) have no /source/main suffix.
+	// Program includes (/programs/includes/ZZ_NAME) DO need /source/main — /includes/ here is the collection path.
+	isClassInclude := strings.Contains(objectURL, "/oo/classes/") && strings.Contains(objectURL, "/includes/")
+	if !isClassInclude {
 		artifactURI = objectURL + "/source/main"
 	}
 	encodedContent := base64.StdEncoding.EncodeToString([]byte(content))
@@ -61,18 +74,22 @@ func (c *Client) SyntaxCheck(ctx context.Context, objectURL string, content stri
 		ContentType: "application/*",
 	})
 	if err != nil {
-		return nil, fmt.Errorf("syntax check failed: %w", err)
+		return nil, err
 	}
-
-	return parseSyntaxCheckResults(resp.Body)
+	return resp.Body, nil
 }
 
 func parseSyntaxCheckResults(data []byte) ([]SyntaxCheckResult, error) {
-	// The response uses namespace prefixes like chkrun:uri, chkrun:type, etc.
-	// Go's xml package doesn't handle namespaced attributes well, so we strip the prefix
-	xmlStr := string(data)
-	xmlStr = strings.ReplaceAll(xmlStr, "chkrun:", "")
-
+	// The response uses namespace prefixes — chkrun:uri, chkrun:type — and this
+	// used to strip "chkrun:" out of the whole document first, on the belief that
+	// encoding/xml cannot match a prefixed attribute. It can: a tag of
+	// `xml:"type,attr"` matches on local name, whatever the prefix, which is why
+	// the activation checklist reads adtcore:type without any such help.
+	//
+	// The strip was not merely unnecessary. It rewrote every byte of the payload,
+	// message text included, so a shortText that mentioned the namespace came
+	// back with the prefix cut out of the sentence — SAP's diagnostic, quietly
+	// altered on the way to the caller.
 	type checkMessage struct {
 		URI       string `xml:"uri,attr"`
 		Type      string `xml:"type,attr"`
@@ -89,7 +106,7 @@ func parseSyntaxCheckResults(data []byte) ([]SyntaxCheckResult, error) {
 	}
 
 	var resp checkRunReports
-	if err := xml.Unmarshal([]byte(xmlStr), &resp); err != nil {
+	if err := xml.Unmarshal(data, &resp); err != nil {
 		return nil, fmt.Errorf("parsing syntax check response: %w", err)
 	}
 
@@ -176,7 +193,106 @@ func (c *Client) Activate(ctx context.Context, objectURL string, objectName stri
 		return nil, fmt.Errorf("activation failed: %w", err)
 	}
 
-	return parseActivationResult(resp.Body)
+	result, err := parseActivationResult(resp.Body)
+	if err != nil || !refusedWithoutReason(result) {
+		return result, err
+	}
+	return c.activateWithInactiveParts(ctx, objectURL, objectName, result)
+}
+
+// refusedWithoutReason is a refusal with nothing in it: no message, no
+// inactive dependency named.
+func refusedWithoutReason(r *ActivationResult) bool {
+	return r != nil && !r.Success && len(r.Messages) == 0 && len(r.Inactive) == 0
+}
+
+// activateWithInactiveParts handles the refusal SAP gives when the object
+// itself has nothing to activate but a part of it does. Activating a function
+// group whose include was changed is the case that mattered: SAP refuses
+// without a word, the include stays inactive, and a request released next
+// carries the old source. SE80 activates the group together with its inactive
+// parts; so does this -- the caller's own inactive objects below the object's
+// URI, and nobody else's. When a part still does not activate, the result
+// names it.
+func (c *Client) activateWithInactiveParts(ctx context.Context, objectURL, objectName string, refused *ActivationResult) (*ActivationResult, error) {
+	records, err := c.GetInactiveObjects(ctx)
+	if err != nil {
+		return refused, nil
+	}
+	parts := inactivePartsOf(objectURL, c.config.Username, records)
+	if len(parts) == 0 {
+		// Nothing of the object is inactive: SAP refused because there was
+		// nothing to do. Calling that "still inactive" sends the caller off to
+		// repair an object that is fine.
+		if !objectInactive(objectURL, records) {
+			return &ActivationResult{Success: true, Messages: []ActivationResultMessage{{
+				Type: "I", ShortText: "Nothing to activate: the object has no inactive version",
+			}}}, nil
+		}
+		return refused, nil
+	}
+	// With a cookie or SSO logon the client does not know its user name, so
+	// it cannot tell its own inactive parts from a colleague's. It activates
+	// none of them then, and names them for the caller to activate by name.
+	if c.config.Username == "" {
+		refused.Inactive = parts
+		refused.Messages = append(refused.Messages, ActivationResultMessage{
+			Type:      "W",
+			ShortText: "Parts of the object are inactive; whose they are is unknown without a user name (cookie/SSO logon), so they were not activated with it -- activate them by name",
+		})
+		return refused, nil
+	}
+	refs := []ObjectRef{{URI: objectURL, Name: objectName}}
+	for _, p := range parts {
+		refs = append(refs, ObjectRef{URI: p.URI, Name: p.Name})
+	}
+	result, err := c.ActivateMultiple(ctx, refs)
+	if err != nil {
+		return nil, err
+	}
+	if result.Success {
+		return result, nil
+	}
+	if len(result.Messages) == 0 && len(result.Inactive) == 0 {
+		// Refused again without a word: name what is still inactive now, not
+		// everything that was tried -- some parts may have gone through.
+		result.Inactive = parts
+		if after, rerr := c.GetInactiveObjects(ctx); rerr == nil {
+			result.Inactive = inactivePartsOf(objectURL, c.config.Username, after)
+		}
+	}
+	return result, nil
+}
+
+// objectInactive says whether the object itself is in the inactive list.
+func objectInactive(objectURL string, records []InactiveObjectRecord) bool {
+	base := strings.ToLower(strings.TrimSuffix(strings.TrimSuffix(objectURL, "/source/main"), "/"))
+	for _, r := range records {
+		if r.Object != nil && strings.EqualFold(strings.TrimSuffix(r.Object.URI, "/"), base) {
+			return true
+		}
+	}
+	return false
+}
+
+// inactivePartsOf picks the inactive objects that belong to the object at
+// objectURL -- its URI is a prefix of theirs -- and to user, if user is known.
+func inactivePartsOf(objectURL, user string, records []InactiveObjectRecord) []InactiveObject {
+	base := strings.ToLower(strings.TrimSuffix(strings.TrimSuffix(objectURL, "/source/main"), "/")) + "/"
+	var parts []InactiveObject
+	for _, r := range records {
+		o := r.Object
+		if o == nil || o.Deleted {
+			continue
+		}
+		if user != "" && o.User != "" && !strings.EqualFold(o.User, user) {
+			continue
+		}
+		if strings.HasPrefix(strings.ToLower(o.URI), base) {
+			parts = append(parts, *o)
+		}
+	}
+	return parts
 }
 
 func parseActivationResult(data []byte) (*ActivationResult, error) {
@@ -191,18 +307,33 @@ func parseActivationResult(data []byte) (*ActivationResult, error) {
 		return result, nil
 	}
 
+	// SAP splits one message across several <txt> siblings — "Activation was
+	// cancelled." and `"Editing canceled" (EU 202)` arrive as two — so this is a
+	// list, not a string. A string field would be overwritten by each element in
+	// turn and keep only the last, which is reliably the least informative half.
+	// Chardata covers the releases that put the text straight in <shortText>.
+	type shortText struct {
+		Texts    []string `xml:"txt"`
+		CharData string   `xml:",chardata"`
+	}
 	type msg struct {
-		ObjDescr       string `xml:"objDescr,attr"`
-		Type           string `xml:"type,attr"`
-		Line           int    `xml:"line,attr"`
-		Href           string `xml:"href,attr"`
-		ForceSupported bool   `xml:"forceSupported,attr"`
-		ShortText      struct {
-			Text string `xml:"txt"`
-		} `xml:"shortText"`
+		ObjDescr       string    `xml:"objDescr,attr"`
+		Type           string    `xml:"type,attr"`
+		Line           int       `xml:"line,attr"`
+		Href           string    `xml:"href,attr"`
+		ForceSupported bool      `xml:"forceSupported,attr"`
+		ShortText      shortText `xml:"shortText"`
+	}
+	// The checklist's own verdict on whether anything happened. A checklist can
+	// refuse with nothing but warnings in it — activationExecuted="false" beside
+	// a type="W" "Activation was cancelled." — and reading only message types
+	// calls that a success while the object is still inactive.
+	type properties struct {
+		ActivationExecuted string `xml:"activationExecuted,attr"`
 	}
 	type messages struct {
-		Msgs []msg `xml:"msg"`
+		Props *properties `xml:"properties"`
+		Msgs  []msg       `xml:"msg"`
 	}
 	type inactiveRef struct {
 		URI       string `xml:"uri,attr"`
@@ -218,7 +349,17 @@ func parseActivationResult(data []byte) (*ActivationResult, error) {
 	type inactiveObjects struct {
 		Entries []inactiveEntry `xml:"entry"`
 	}
+	// ADT sends the checklist either as the document root (<chkl:messages> or
+	// <ioc:inactiveObjects>, whose children land directly on this struct) or
+	// wrapped in an outer element (where they are one level down). Both shapes
+	// are declared here rather than parsed in two passes, because the root and
+	// the wrapper never use the same element names and so cannot collide.
 	type response struct {
+		// Root shape: this struct *is* <chkl:messages> / <ioc:inactiveObjects>.
+		Props   *properties     `xml:"properties"`
+		Msgs    []msg           `xml:"msg"`
+		Entries []inactiveEntry `xml:"entry"`
+		// Wrapped shape.
 		Messages messages        `xml:"messages"`
 		Inactive inactiveObjects `xml:"inactiveObjects"`
 	}
@@ -234,16 +375,11 @@ func parseActivationResult(data []byte) (*ActivationResult, error) {
 		return result, nil
 	}
 
-	// ADT returns the checklist either wrapped or as the document root
-	// (<chkl:messages> with <msg> children). Only the wrapped shape matches the
-	// struct above, so fall back to the root shape — otherwise a failed
-	// activation parses to nothing and is reported as a success.
-	msgs := resp.Messages.Msgs
-	if len(msgs) == 0 {
-		var root messages
-		if err := xml.Unmarshal(data, &root); err == nil {
-			msgs = root.Msgs
-		}
+	msgs := append(append([]msg{}, resp.Msgs...), resp.Messages.Msgs...)
+	entries := append(append([]inactiveEntry{}, resp.Entries...), resp.Inactive.Entries...)
+	props := resp.Props
+	if props == nil {
+		props = resp.Messages.Props
 	}
 
 	for _, m := range msgs {
@@ -253,15 +389,15 @@ func parseActivationResult(data []byte) (*ActivationResult, error) {
 			Line:           m.Line,
 			Href:           m.Href,
 			ForceSupported: m.ForceSupported,
-			ShortText:      m.ShortText.Text,
+			ShortText:      joinShortText(m.ShortText.Texts, m.ShortText.CharData),
 		})
 		// Check for errors
-		if strings.ContainsAny(m.Type, "EAX") {
+		if strings.ContainsAny(m.Type, activationErrorTypes) {
 			result.Success = false
 		}
 	}
 
-	for _, entry := range resp.Inactive.Entries {
+	for _, entry := range entries {
 		if entry.Object != nil {
 			result.Success = false
 			result.Inactive = append(result.Inactive, InactiveObject{
@@ -273,7 +409,29 @@ func parseActivationResult(data []byte) (*ActivationResult, error) {
 		}
 	}
 
+	// Only an explicit "false" is a refusal. An absent attribute means this
+	// release did not say, and guessing from silence is how the messages got
+	// dropped in the first place.
+	if props != nil && strings.EqualFold(strings.TrimSpace(props.ActivationExecuted), "false") {
+		result.Success = false
+	}
+
 	return result, nil
+}
+
+// joinShortText renders SAP's <shortText> as the one line the rest of the code
+// expects, keeping every <txt> sibling in the order SAP wrote them.
+func joinShortText(texts []string, chardata string) string {
+	parts := make([]string, 0, len(texts))
+	for _, t := range texts {
+		if t = strings.TrimSpace(t); t != "" {
+			parts = append(parts, t)
+		}
+	}
+	if len(parts) == 0 {
+		return strings.TrimSpace(chardata)
+	}
+	return strings.Join(parts, " ")
 }
 
 // GetInactiveObjects retrieves all inactive objects for the current user.
@@ -354,6 +512,47 @@ func parseInactiveObjects(data []byte) ([]InactiveObjectRecord, error) {
 }
 
 // --- Batch Activation ---
+
+// ObjectRef is a URI + name pair used to reference an ADT object in activation requests.
+type ObjectRef struct {
+	URI  string `json:"uri"`
+	Name string `json:"name"`
+}
+
+// ActivateMultiple activates multiple objects in a single ADT request, allowing SAP to
+// resolve mutual dependencies between them (e.g., a program and all its includes).
+// This is the correct approach when objects reference symbols defined in each other —
+// activating them one by one fails because the first object can't see the others.
+func (c *Client) ActivateMultiple(ctx context.Context, objects []ObjectRef) (*ActivationResult, error) {
+	if err := c.checkSafety(OpActivate, "ActivateMultiple"); err != nil {
+		return nil, err
+	}
+	if len(objects) == 0 {
+		return &ActivationResult{Success: true, Messages: []ActivationResultMessage{}, Inactive: []InactiveObject{}}, nil
+	}
+	if len(objects) == 1 {
+		return c.Activate(ctx, objects[0].URI, objects[0].Name)
+	}
+
+	var sb strings.Builder
+	sb.WriteString("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n")
+	sb.WriteString("<adtcore:objectReferences xmlns:adtcore=\"http://www.sap.com/adt/core\">\n")
+	for _, obj := range objects {
+		sb.WriteString(fmt.Sprintf("  <adtcore:objectReference adtcore:uri=\"%s\" adtcore:name=\"%s\"/>\n",
+			obj.URI, obj.Name))
+	}
+	sb.WriteString("</adtcore:objectReferences>")
+
+	resp, err := c.transport.Request(ctx, "/sap/bc/adt/activation?method=activate&preauditRequested=true", &RequestOptions{
+		Method:      http.MethodPost,
+		Body:        []byte(sb.String()),
+		ContentType: "application/xml",
+	})
+	if err != nil {
+		return nil, fmt.Errorf("batch activation failed: %w", err)
+	}
+	return parseActivationResult(resp.Body)
+}
 
 // ActivatePackageResult represents the result of batch activation.
 type ActivatePackageResult struct {
@@ -448,14 +647,24 @@ func (c *Client) ActivatePackage(ctx context.Context, packageName string, maxObj
 			continue
 		}
 		obj := rec.Object
-		_, err := c.Activate(ctx, obj.URI, obj.Name)
-		if err != nil {
+		activation, err := c.Activate(ctx, obj.URI, obj.Name)
+		switch {
+		case err != nil:
 			result.Failed = append(result.Failed, ActivationFailed{
 				Name:   obj.Name,
 				Type:   obj.Type,
 				Reason: err.Error(),
 			})
-		} else {
+		case !activation.Success:
+			// The object that refuses to activate answers 200 like the rest, so
+			// counting only transport errors put it in the Activated list and
+			// the summary then said "Activated 12 objects" about eleven.
+			result.Failed = append(result.Failed, ActivationFailed{
+				Name:   obj.Name,
+				Type:   obj.Type,
+				Reason: strings.Join(activation.ProblemLines(), "; "),
+			})
+		default:
 			result.Activated = append(result.Activated, ActivatedObject{
 				Name: obj.Name,
 				Type: obj.Type,
@@ -577,6 +786,18 @@ func DefaultUnitTestFlags() UnitTestRunFlags {
 	}
 }
 
+// checkUnitTestRisk refuses a test run that includes test classes declared
+// RISK LEVEL DANGEROUS or CRITICAL under --read-only: such tests may change
+// persistent data or system settings, which is what the level says. Every
+// path that posts an ABAP Unit run (RunUnitTests, GetCodeCoverage) calls it.
+// Harmless runs are unchanged.
+func (c *Client) checkUnitTestRisk(flags *UnitTestRunFlags, opName string) error {
+	if flags != nil && (flags.Dangerous || flags.Critical) && c.config.Safety.ReadOnly && !c.config.Safety.DryRun {
+		return fmt.Errorf("operation '%s' with dangerous or critical tests is blocked: read-only mode enabled (run without include_dangerous)", opName)
+	}
+	return nil
+}
+
 // UnitTestResult represents the complete result of a unit test run.
 type UnitTestResult struct {
 	Classes []UnitTestClass `json:"classes"`
@@ -641,6 +862,9 @@ func (c *Client) RunUnitTests(ctx context.Context, objectURL string, flags *Unit
 	if flags == nil {
 		defaultFlags := DefaultUnitTestFlags()
 		flags = &defaultFlags
+	}
+	if err := c.checkUnitTestRisk(flags, "RunUnitTests"); err != nil {
+		return nil, err
 	}
 
 	body := fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>

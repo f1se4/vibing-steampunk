@@ -83,6 +83,102 @@ func TestClient_SearchObject(t *testing.T) {
 	}
 }
 
+func TestCanonicalObjectType(t *testing.T) {
+	cases := []struct {
+		in   string
+		want string
+	}{
+		// Short forms expand to ADT-canonical group codes
+		{"CLAS", "CLAS/OC"},
+		{"INTF", "INTF/OI"},
+		{"PROG", "PROG/P"},
+		{"INCL", "PROG/I"},
+		{"FUGR", "FUGR/F"},
+		{"FUNC", "FUGR/FF"},
+		{"TABL", "TABL/DT"},
+		{"DTEL", "DTEL/DE"},
+		{"DOMA", "DOMA/DD"},
+		{"TTYP", "TTYP/DA"},
+		{"ENQU", "ENQU/DL"},
+		{"DDLS", "DDLS/DF"},
+		{"MSAG", "MSAG/N"},
+		{"TRAN", "TRAN/T"},
+		// Case-insensitive
+		{"clas", "CLAS/OC"},
+		// Empty stays empty (means "any type")
+		{"", ""},
+		// Already-canonical and unknown values pass through verbatim
+		{"CLAS/OC", "CLAS/OC"},
+		{"ZCUSTOM/XX", "ZCUSTOM/XX"},
+	}
+	for _, tc := range cases {
+		if got := CanonicalObjectType(tc.in); got != tc.want {
+			t.Errorf("CanonicalObjectType(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+func TestClient_SearchObjectByType_QueryParams(t *testing.T) {
+	emptyResponse := `<?xml version="1.0" encoding="UTF-8"?>
+<adtcore:objectReferences xmlns:adtcore="http://www.sap.com/adt/core"/>`
+
+	cases := []struct {
+		name        string
+		objectType  string
+		wantPresent bool
+		wantValue   string
+	}{
+		{"with type sends objectType param", "CLAS/OC", true, "CLAS/OC"},
+		{"empty type omits objectType param", "", false, ""},
+		{"short form CLAS expands to CLAS/OC", "CLAS", true, "CLAS/OC"},
+		{"short form FUNC expands to FUGR/FF", "FUNC", true, "FUGR/FF"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			mock := &mockTransportClient{
+				responses: map[string]*http.Response{
+					"search":    newTestResponse(emptyResponse),
+					"discovery": newTestResponse("OK"),
+				},
+			}
+
+			cfg := NewConfig("https://sap.example.com:44300", "user", "pass")
+			transport := NewTransportWithClient(cfg, mock)
+			client := NewClientWithTransport(cfg, transport)
+
+			if _, err := client.SearchObjectByType(context.Background(), "Z*", tc.objectType, 50); err != nil {
+				t.Fatalf("SearchObjectByType failed: %v", err)
+			}
+
+			var searchReq *http.Request
+			for _, r := range mock.requests {
+				if strings.Contains(r.URL.Path, "informationsystem/search") {
+					searchReq = r
+					break
+				}
+			}
+			if searchReq == nil {
+				t.Fatalf("no search request captured (got %d requests)", len(mock.requests))
+			}
+
+			q := searchReq.URL.Query()
+			if got := q.Get("query"); got != "Z*" {
+				t.Errorf("query = %q, want %q", got, "Z*")
+			}
+			if got := q.Get("maxResults"); got != "50" {
+				t.Errorf("maxResults = %q, want %q", got, "50")
+			}
+			values, present := q["objectType"]
+			if present != tc.wantPresent {
+				t.Errorf("objectType present = %v, want %v (values=%v)", present, tc.wantPresent, values)
+			}
+			if tc.wantPresent && (len(values) == 0 || values[0] != tc.wantValue) {
+				t.Errorf("objectType = %v, want %q", values, tc.wantValue)
+			}
+		})
+	}
+}
+
 func TestClient_CheckObjectPackageSafety_NormalizesObjectURLs(t *testing.T) {
 	tests := []struct {
 		name      string
@@ -114,10 +210,34 @@ func TestClient_CheckObjectPackageSafety_NormalizesObjectURLs(t *testing.T) {
 			transport := NewTransportWithClient(cfg, mock)
 			client := NewClientWithTransport(cfg, transport)
 
-			if err := client.checkObjectPackageSafety(context.Background(), tt.objectURL); err != nil {
+			if err := client.checkObjectPackageSafety(context.Background(), tt.objectURL, false); err != nil {
 				t.Fatalf("checkObjectPackageSafety failed: %v", err)
 			}
 		})
+	}
+}
+
+func TestNormalizeObjectURLForPackageCheck(t *testing.T) {
+	cases := []struct {
+		input string
+		want  string
+	}{
+		// Program includes (INCL) — /includes/ is the collection path, must not be mangled
+		{"/sap/bc/adt/programs/includes/ZTEST_INCL", "/sap/bc/adt/programs/includes/ZTEST_INCL"},
+		{"/sap/bc/adt/programs/includes/ZTEST_INCL/source/main", "/sap/bc/adt/programs/includes/ZTEST_INCL"},
+		// Regular programs — only /source/main stripped
+		{"/sap/bc/adt/programs/programs/ZTEST/source/main", "/sap/bc/adt/programs/programs/ZTEST"},
+		// Class includes — strip /includes/... to parent class
+		{"/sap/bc/adt/oo/classes/ZCL_FOO/includes/testclasses", "/sap/bc/adt/oo/classes/ZCL_FOO"},
+		{"/sap/bc/adt/oo/classes/ZCL_FOO/includes/definitions", "/sap/bc/adt/oo/classes/ZCL_FOO"},
+		// Class source — strip /source/main only
+		{"/sap/bc/adt/oo/classes/ZCL_FOO/source/main", "/sap/bc/adt/oo/classes/ZCL_FOO"},
+	}
+	for _, tc := range cases {
+		got := normalizeObjectURLForPackageCheck(tc.input)
+		if got != tc.want {
+			t.Errorf("normalizeObjectURLForPackageCheck(%q)\n  got  %q\n  want %q", tc.input, got, tc.want)
+		}
 	}
 }
 
@@ -449,5 +569,55 @@ func TestParseSRVBMetadata(t *testing.T) {
 	}
 	if result.ServiceDefName != "Z_RAP_TRAVEL" {
 		t.Errorf("expected service def name 'Z_RAP_TRAVEL', got '%s'", result.ServiceDefName)
+	}
+}
+
+func TestClient_CheckObjectPackageByName(t *testing.T) {
+	cases := []struct {
+		name       string
+		objectType string
+		hitType    string
+		hitPackage string
+		wantErr    string
+	}{
+		{"allowed package", "PROG", "PROG/P", "ZDEMO", ""},
+		{"forbidden package", "PROG", "PROG/P", "$TMP", "operations on package '$TMP' are blocked by safety configuration"},
+		{"no hit of that type fails closed", "CLAS", "PROG/P", "ZDEMO", "package metadata not found"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			search := newSearchResponse("/sap/bc/adt/programs/programs/zdemo_report", tc.hitType, "ZDEMO_REPORT", tc.hitPackage)
+			defer search.Body.Close()
+			discovery := newTestResponse("OK")
+			defer discovery.Body.Close()
+			mock := &mockTransportClient{
+				responses: map[string]*http.Response{"search": search, "discovery": discovery},
+			}
+			cfg := NewConfig("https://sap.example.com:44300", "user", "pass", WithAllowedPackages("Z*"))
+			client := NewClientWithTransport(cfg, NewTransportWithClient(cfg, mock))
+
+			err := client.CheckObjectPackageByName(context.Background(), tc.objectType, "zdemo_report")
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Fatalf("unexpected refusal: %v", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("got %v, want an error containing %q", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+func TestClient_CheckObjectPackageByName_NoWhitelistSendsNothing(t *testing.T) {
+	mock := &mockTransportClient{responses: map[string]*http.Response{}}
+	cfg := NewConfig("https://sap.example.com:44300", "user", "pass")
+	client := NewClientWithTransport(cfg, NewTransportWithClient(cfg, mock))
+	if err := client.CheckObjectPackageByName(context.Background(), "PROG", "ZDEMO_REPORT"); err != nil {
+		t.Fatalf("refused without a package whitelist: %v", err)
+	}
+	if len(mock.requests) != 0 {
+		t.Errorf("sent %d request(s) without a package whitelist", len(mock.requests))
 	}
 }

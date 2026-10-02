@@ -3,16 +3,19 @@ package main
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/signal"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
 	"time"
 
-	"github.com/oisee/vibing-steampunk/pkg/adt"
 	"github.com/spf13/cobra"
+
+	"github.com/oisee/vibing-steampunk/pkg/adt"
 )
 
 var debugCmd = &cobra.Command{
@@ -73,26 +76,35 @@ type debugSession struct {
 	user       string
 	attached   bool
 	debuggeeID string
-	ctx        context.Context
-	cancel     context.CancelFunc
+	// readOnly is the system's read_only / SAP_READ_ONLY: "run" and "call"
+	// execute code on the system, and are refused when it is set.
+	readOnly bool
+	ctx      context.Context
+	cancel   context.CancelFunc
 }
 
 func runDebug(cmd *cobra.Command, args []string) error {
 	// Resolve configuration (same as MCP server)
 	resolveConfig(cmd.Parent())
 
-	// Validate we have auth
-	if err := validateConfig(); err != nil {
-		return err
-	}
+	// No validateConfig() here on purpose: it checks the global cfg.BaseURL,
+	// which a named system (-s / .vsp.json) never populates, so it rejected
+	// `-s a4h` before the resolver ever ran. createADTClientFor resolves the
+	// system and reports a real error if none can be found.
 
-	// Process cookie auth
-	if err := processCookieAuth(cmd.Parent()); err != nil {
-		return err
-	}
+	// No processCookieAuth here either: it reads the same global cfg. A named
+	// system carries its own credentials through resolveSystemParams, which is
+	// how deploy, deps and every other -s-aware command already work.
 
 	// Create ADT client
-	client := createADTClient()
+	client, err := createADTClientFor(cmd)
+	if err != nil {
+		return err
+	}
+	params, err := resolveSystemParams(cmd)
+	if err != nil {
+		return err
+	}
 
 	// Get user for debugging
 	user := debugUser
@@ -117,13 +129,7 @@ func runDebug(cmd *cobra.Command, args []string) error {
 	}()
 
 	// Create WebSocket client for breakpoints
-	wsClient := adt.NewDebugWebSocketClient(
-		cfg.BaseURL,
-		cfg.Client,
-		cfg.Username,
-		cfg.Password,
-		cfg.InsecureSkipVerify,
-	)
+	wsClient := client.NewDebugWebSocketClient()
 
 	// Try to connect WebSocket (optional - falls back to HTTP if unavailable)
 	wsConnected := false
@@ -140,6 +146,7 @@ func runDebug(cmd *cobra.Command, args []string) error {
 		client:   client,
 		wsClient: wsClient,
 		user:     user,
+		readOnly: cliReadOnly(params),
 		ctx:      ctx,
 		cancel:   cancel,
 	}
@@ -208,7 +215,7 @@ func (s *debugSession) repl() error {
 		}
 
 		// Parse and execute command
-		parts := strings.Fields(line)
+		parts := splitREPLArgs(line)
 		cmd := strings.ToLower(parts[0])
 		args := parts[1:]
 
@@ -581,6 +588,11 @@ func (s *debugSession) listBreakpoints() error {
 
 	fmt.Println("\nBreakpoints:")
 	for _, bp := range bps.Breakpoints {
+		// A listing shows what is placed; a refusal belongs to whoever asked
+		// for the placement, not to a later reader.
+		if bp.ID == "" {
+			continue
+		}
 		fmt.Printf("  %s: %s (kind: %s)\n", bp.ID, bp.URI, bp.Kind)
 	}
 	fmt.Println()
@@ -608,6 +620,11 @@ func (s *debugSession) runProgram(args []string) error {
 		fmt.Println("         run ZADT_DEBUG_TRIGGER TESTVAR")
 		fmt.Println("\nThis will: set up listener → trigger program → auto-attach")
 		return nil
+	}
+
+	// Before the listener starts or anything is submitted.
+	if err := cliWorkflowGate(s.readOnly, "RunReport"); err != nil {
+		return err
 	}
 
 	if s.wsClient == nil {
@@ -715,17 +732,29 @@ func (s *debugSession) callRFC(args []string) error {
 		return nil
 	}
 
+	if err := cliWorkflowGate(s.readOnly, "RFCCall"); err != nil {
+		return err
+	}
+
 	if s.wsClient == nil {
 		return fmt.Errorf("WebSocket not connected - cannot call RFC")
 	}
 
 	fm := strings.ToUpper(args[0])
-	params := make(map[string]string)
+	params := make(map[string]any)
 
 	// Parse param=value pairs
 	for _, arg := range args[1:] {
 		parts := strings.SplitN(arg, "=", 2)
 		if len(parts) == 2 {
+			// {…} or […] is a structure or a table, passed as JSON.
+			if v := strings.TrimSpace(parts[1]); strings.HasPrefix(v, "{") || strings.HasPrefix(v, "[") {
+				var obj any
+				if err := json.Unmarshal([]byte(v), &obj); err == nil {
+					params[strings.ToUpper(parts[0])] = obj
+					continue
+				}
+			}
 			params[strings.ToUpper(parts[0])] = parts[1]
 		}
 	}
@@ -743,6 +772,37 @@ func (s *debugSession) callRFC(args []string) error {
 	fmt.Printf("Result: subrc=%d\n", result.Subrc)
 
 	// Print exports if any
+	if result.Message != "" {
+		fmt.Printf("Message: %s\n", result.Message)
+	}
+	if len(result.Tables) > 0 {
+		fmt.Println("Tables:")
+		for name, rows := range result.Tables {
+			if list, ok := rows.([]any); ok {
+				fmt.Printf("  %s (%d rows)\n", name, len(list))
+				for i, row := range list {
+					if i >= 40 {
+						fmt.Printf("    … %d more\n", len(list)-40)
+						break
+					}
+					if m, ok := row.(map[string]any); ok {
+						var parts []string
+						for k, v := range m {
+							if str := fmt.Sprint(v); strings.TrimSpace(str) != "" {
+								parts = append(parts, k+"="+str)
+							}
+						}
+						sort.Strings(parts)
+						fmt.Printf("    %s\n", strings.Join(parts, " "))
+					} else {
+						fmt.Printf("    %v\n", row)
+					}
+				}
+			} else {
+				fmt.Printf("  %s = %v\n", name, rows)
+			}
+		}
+	}
 	if len(result.Exports) > 0 {
 		fmt.Println("Exports:")
 		for k, v := range result.Exports {
@@ -751,4 +811,43 @@ func (s *debugSession) callRFC(args []string) error {
 	}
 
 	return nil
+}
+
+// splitREPLArgs splits a REPL line on blanks, except inside a quoted
+// string or inside {…} / […]: a call's parameter may be a JSON object or
+// array, and "PROCESS BEFORE OUTPUT." has blanks in it.
+func splitREPLArgs(line string) []string {
+	var out []string
+	var cur strings.Builder
+	depth, inStr, esc, has := 0, false, false, false
+	flush := func() {
+		if has {
+			out = append(out, cur.String())
+			cur.Reset()
+			has = false
+		}
+	}
+	for _, r := range line {
+		switch {
+		case esc:
+			esc = false
+		case inStr && r == '\\':
+			esc = true
+		case r == '"':
+			inStr = !inStr
+		case !inStr && (r == '{' || r == '['):
+			depth++
+		case !inStr && (r == '}' || r == ']'):
+			if depth > 0 {
+				depth--
+			}
+		case !inStr && depth == 0 && (r == ' ' || r == '\t'):
+			flush()
+			continue
+		}
+		cur.WriteRune(r)
+		has = true
+	}
+	flush()
+	return out
 }

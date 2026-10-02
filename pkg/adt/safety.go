@@ -70,6 +70,13 @@ type SafetyConfig struct {
 	//   - User takes responsibility for transport management
 	// Use --allow-transportable-edits or SAP_ALLOW_TRANSPORTABLE_EDITS=true to enable
 	AllowTransportableEdits bool
+
+	// TransportChoice says what a write to a transportable object does when
+	// no request is named: "auto" (or empty) picks one the way the editor
+	// would — the object's own, else an open request of the user's that
+	// fits — and creates one when none does and transports are enabled;
+	// "off" leaves the choice to SAP, which generates a request per write.
+	TransportChoice string
 }
 
 // DefaultSafetyConfig returns a safe default configuration (read-only, no free SQL)
@@ -271,7 +278,12 @@ func (s *SafetyConfig) CheckTransport(transport, opName string, isWrite bool) er
 		return fmt.Errorf("transport operation '%s' is blocked: transports not enabled (use --enable-transports or SAP_ENABLE_TRANSPORTS=true)", opName)
 	}
 
-	// Check write permissions
+	// Check write permissions. --read-only covers transports too: creating,
+	// releasing, deleting, merging or moving a request changes the system as
+	// surely as an edit does.
+	if isWrite && s.ReadOnly {
+		return fmt.Errorf("transport write operation '%s' is blocked: read-only mode enabled", opName)
+	}
 	if isWrite && s.TransportReadOnly {
 		return fmt.Errorf("transport write operation '%s' is blocked: transport read-only mode enabled", opName)
 	}

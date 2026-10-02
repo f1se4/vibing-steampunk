@@ -1,7 +1,20 @@
 // Package embedded provides embedded ABAP source files for ZADT_VSP deployment.
+//
+// The .abap files this package embeds are copies of src/, the abapGit
+// repository and the only place they are maintained. go:embed cannot reach a
+// parent directory, so they are copied here by go generate, and
+// TestEmbeddedSourcesMatchSrc fails when a copy has drifted from src/. Edit the
+// class in src/, then run:
+//
+//	go generate ./embedded/abap
 package embedded
 
-import _ "embed"
+import (
+	_ "embed"
+	"strings"
+)
+
+//go:generate go run sync_from_src.go
 
 // ZADT_VSP WebSocket Handler Components
 // These files are deployed to SAP systems to enable WebSocket-based operations.
@@ -12,8 +25,8 @@ var ZifVspService string
 //go:embed zcl_vsp_utils.clas.abap
 var ZclVspUtils string
 
-//go:embed zadt_cl_tadir_move.clas.abap
-var ZadtClTadirMove string
+//go:embed zcl_vsp_tadir_move.clas.abap
+var ZclVspTadirMove string
 
 //go:embed zcl_vsp_rfc_service.clas.abap
 var ZclVspRfcService string
@@ -30,16 +43,40 @@ var ZclVspGitService string
 //go:embed zcl_vsp_report_service.clas.abap
 var ZclVspReportService string
 
+//go:embed zcl_vsp_transport_service.clas.abap
+var ZclVspTransportService string
+
+//go:embed zvsp_transport_buffer.prog.abap
+var ZvspTransportBuffer string
+
+//go:embed zvsp_git_import.prog.abap
+var ZvspGitImport string
+
 //go:embed zcl_vsp_apc_handler.clas.abap
 var ZclVspApcHandler string
 
 // ObjectInfo describes an embedded ABAP object.
 type ObjectInfo struct {
-	Type        string // INTF or CLAS
+	Type        string // INTF, CLAS or PROG
 	Name        string // Object name (e.g., ZIF_VSP_SERVICE)
 	Source      string // Source code
 	Description string // Human-readable description
 	Optional    bool   // If true, can be skipped (e.g., Git service without abapGit)
+	// RequiresAbapGit: the object names abapGit's classes (or one that does),
+	// so it is deployed only where abapGit is installed.
+	RequiresAbapGit bool
+}
+
+// FileName is the abapGit file name of an object, the same in src/ and here.
+func FileName(o ObjectInfo) string {
+	ext := ".clas.abap"
+	switch o.Type {
+	case "INTF":
+		ext = ".intf.abap"
+	case "PROG":
+		ext = ".prog.abap"
+	}
+	return strings.ToLower(o.Name) + ext
 }
 
 // GetObjects returns all ZADT_VSP objects in deployment order.
@@ -61,8 +98,8 @@ func GetObjects() []ObjectInfo {
 		},
 		{
 			Type:        "CLAS",
-			Name:        "ZADT_CL_TADIR_MOVE",
-			Source:      ZadtClTadirMove,
+			Name:        "ZCL_VSP_TADIR_MOVE",
+			Source:      ZclVspTadirMove,
 			Description: "Helper class for moving objects between packages",
 			Optional:    false,
 		},
@@ -91,8 +128,10 @@ func GetObjects() []ObjectInfo {
 			Type:        "CLAS",
 			Name:        "ZCL_VSP_GIT_SERVICE",
 			Source:      ZclVspGitService,
-			Description: "Git domain - abapGit export (requires abapGit)",
+			Description: "Git domain - abapGit export and zip import (requires abapGit)",
 			Optional:    true, // Requires abapGit on SAP system
+			// The APC handler creates it dynamically, so ZADT_VSP runs without it.
+			RequiresAbapGit: true,
 		},
 		{
 			Type:        "CLAS",
@@ -100,6 +139,28 @@ func GetObjects() []ObjectInfo {
 			Source:      ZclVspReportService,
 			Description: "Report domain - background job execution with spool output",
 			Optional:    false,
+		},
+		{
+			Type:        "CLAS",
+			Name:        "ZCL_VSP_TRANSPORT_SERVICE",
+			Source:      ZclVspTransportService,
+			Description: "Transport domain - upload K/R files, add to import buffer",
+			Optional:    false,
+		},
+		{
+			Type:        "PROG",
+			Name:        "ZVSP_TRANSPORT_BUFFER",
+			Source:      ZvspTransportBuffer,
+			Description: "VSP transport buffer step (background)",
+			Optional:    false,
+		},
+		{
+			Type:            "PROG",
+			Name:            "ZVSP_GIT_IMPORT",
+			Source:          ZvspGitImport,
+			Description:     "VSP abapGit zip import (background)",
+			Optional:        true,
+			RequiresAbapGit: true,
 		},
 		{
 			Type:        "CLAS",

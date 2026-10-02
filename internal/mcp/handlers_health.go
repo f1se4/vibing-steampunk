@@ -10,6 +10,7 @@ import (
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/oisee/vibing-steampunk/pkg/adt"
 	"github.com/oisee/vibing-steampunk/pkg/graph"
+	"github.com/oisee/vibing-steampunk/pkg/graph/adtsource"
 )
 
 type healthScope struct {
@@ -27,12 +28,30 @@ type healthSummary struct {
 type healthSignal struct {
 	Status  string         `json:"status"`
 	Details map[string]any `json:"details,omitempty"`
+	// Unsearched names what this signal could not check. A health report is
+	// read for reassurance, which makes it the worst place in the codebase to
+	// drop a failure: every check that did not run comes back looking like a
+	// check that found nothing, and the object is pronounced healthy on the
+	// strength of questions nobody managed to ask.
+	Unsearched []adt.Unsearched `json:"unsearched,omitempty"`
+	// Note is the same gap in a sentence, for a reader who skims statuses.
+	Note string `json:"note,omitempty"`
+}
+
+// incomplete reports whether this signal's status was reached without all the
+// evidence. Used by the summary, which must not say GOOD over a partial sweep.
+func (h healthSignal) incomplete() bool {
+	return len(h.Unsearched) > 0 || h.Note != "" || h.Status == "ERROR"
 }
 
 type healthResult struct {
 	Scope   healthScope             `json:"scope"`
 	Summary healthSummary           `json:"summary"`
 	Signals map[string]healthSignal `json:"signals"`
+	// Notes repeats the gaps at the top level. An agent reading this JSON has
+	// no stderr and may never open the individual signals; the caveat has to be
+	// where the verdict is.
+	Notes []string `json:"notes,omitempty"`
 }
 
 func (s *Server) handleHealth(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -62,6 +81,7 @@ func (s *Server) handleHealth(ctx context.Context, request mcp.CallToolRequest) 
 	}
 
 	result.Summary = summarizeHealth(result.Signals)
+	result.Notes = healthNotes(result.Signals)
 
 	data, err := json.MarshalIndent(result, "", "  ")
 	if err != nil {
@@ -93,19 +113,8 @@ func (s *Server) collectObjectTests(ctx context.Context, objType, objName string
 	if err != nil {
 		return healthSignal{Status: "ERROR", Details: map[string]any{"message": err.Error()}}
 	}
-	classCount, methodCount, alertCount := summarizeUnitTests(result)
-	status := "PASS"
-	if classCount == 0 {
-		status = "NONE"
-	}
-	if alertCount > 0 {
-		status = "FAIL"
-	}
-	return healthSignal{Status: status, Details: map[string]any{
-		"classes": classCount,
-		"methods": methodCount,
-		"alerts":  alertCount,
-	}}
+	status, details := adtsource.UnitTestVerdict(result)
+	return healthSignal{Status: status, Details: details}
 }
 
 func (s *Server) collectPackageTests(ctx context.Context, pkg string) healthSignal {
@@ -116,7 +125,7 @@ func (s *Server) collectPackageTests(ctx context.Context, pkg string) healthSign
 
 	var testClasses []adt.PackageObject
 	for _, obj := range content.Objects {
-		if strings.ToUpper(obj.Type) == "CLAS" && graph.IsTestCaller(obj.Name, "") {
+		if adtsource.SourceKind(obj.Type) == "CLAS" && graph.IsTestCaller(obj.Name, "") {
 			testClasses = append(testClasses, obj)
 		}
 	}
@@ -131,13 +140,20 @@ func (s *Server) collectPackageTests(ctx context.Context, pkg string) healthSign
 	totalClasses := 0
 	totalMethods := 0
 	totalAlerts := 0
+	ran := 0
+	var missed []adt.Unsearched
 	for _, obj := range testClasses[:limit] {
 		objectURL := buildHealthObjectURL("CLAS", obj.Name, "")
 		result, err := s.adtClient.RunUnitTests(ctx, objectURL, nil)
 		if err != nil {
+			// A test run that never started raises no alerts, and no alerts is
+			// what a passing test looks like from here. Skipping it silently is
+			// how this report tells someone their package is fine.
+			missed = append(missed, adt.Unsearched{Object: obj.Name, Reason: err.Error()})
 			continue
 		}
-		c, m, a := summarizeUnitTests(result)
+		ran++
+		c, m, a := adtsource.UnitTestCounts(result)
 		totalClasses += c
 		totalMethods += m
 		totalAlerts += a
@@ -150,28 +166,42 @@ func (s *Server) collectPackageTests(ctx context.Context, pkg string) healthSign
 	if totalAlerts > 0 {
 		status = "FAIL"
 	}
-	return healthSignal{Status: status, Details: map[string]any{
+	// "NONE" claims the package has no tests. When nothing ran, what we know is
+	// that we could not find out — a different fact, and the opposite one to
+	// act on, so it does not get to borrow the reassuring word.
+	if ran == 0 {
+		status = "ERROR"
+	}
+	signal := healthSignal{Status: status, Details: map[string]any{
 		"test_classes_found": len(testClasses),
-		"test_classes_run":   limit,
+		"test_classes_run":   ran,
+		"test_classes_tried": limit,
 		"classes":            totalClasses,
 		"methods":            totalMethods,
 		"alerts":             totalAlerts,
 	}}
+	signal.Unsearched = missed
+	signal.Note = adt.UnsearchedNote(missed, limit, "test class")
+	// The cap is not a failure, but it is still a reason this PASS covers less
+	// than it sounds like it does.
+	if len(testClasses) > limit {
+		signal.Note = joinNotes(signal.Note, fmt.Sprintf(
+			"only %d of the %d test classes in this package were run, so a passing status here is not a passing package.",
+			limit, len(testClasses)))
+	}
+	return signal
 }
 
-func summarizeUnitTests(result *adt.UnitTestResult) (classCount, methodCount, alertCount int) {
-	if result == nil {
-		return 0, 0, 0
-	}
-	classCount = len(result.Classes)
-	for _, c := range result.Classes {
-		methodCount += len(c.TestMethods)
-		alertCount += len(c.Alerts)
-		for _, m := range c.TestMethods {
-			alertCount += len(m.Alerts)
+// joinNotes puts two caveats in one field without producing a stray newline
+// when one of them is absent.
+func joinNotes(notes ...string) string {
+	var kept []string
+	for _, n := range notes {
+		if n != "" {
+			kept = append(kept, n)
 		}
 	}
-	return classCount, methodCount, alertCount
+	return strings.Join(kept, "\n")
 }
 
 func (s *Server) collectObjectATC(ctx context.Context, objType, objName string) healthSignal {
@@ -183,17 +213,8 @@ func (s *Server) collectObjectATC(ctx context.Context, objType, objName string) 
 	if err != nil {
 		return healthSignal{Status: "ERROR", Details: map[string]any{"message": err.Error()}}
 	}
-	total, errors, warnings, infos := summarizeATC(result)
-	status := "CLEAN"
-	if total > 0 {
-		status = "FINDINGS"
-	}
-	return healthSignal{Status: status, Details: map[string]any{
-		"findings": total,
-		"errors":   errors,
-		"warnings": warnings,
-		"infos":    infos,
-	}}
+	status, details := adtsource.ATCVerdict(result)
+	return healthSignal{Status: status, Details: details}
 }
 
 func (s *Server) collectPackageATC(ctx context.Context, pkg string) healthSignal {
@@ -202,37 +223,8 @@ func (s *Server) collectPackageATC(ctx context.Context, pkg string) healthSignal
 	if err != nil {
 		return healthSignal{Status: "ERROR", Details: map[string]any{"message": err.Error()}}
 	}
-	total, errors, warnings, infos := summarizeATC(result)
-	status := "CLEAN"
-	if total > 0 {
-		status = "FINDINGS"
-	}
-	return healthSignal{Status: status, Details: map[string]any{
-		"findings": total,
-		"errors":   errors,
-		"warnings": warnings,
-		"infos":    infos,
-	}}
-}
-
-func summarizeATC(result *adt.ATCWorklist) (total, errors, warnings, infos int) {
-	if result == nil {
-		return 0, 0, 0, 0
-	}
-	for _, obj := range result.Objects {
-		total += len(obj.Findings)
-		for _, f := range obj.Findings {
-			switch f.Priority {
-			case 1:
-				errors++
-			case 2:
-				warnings++
-			default:
-				infos++
-			}
-		}
-	}
-	return total, errors, warnings, infos
+	status, details := adtsource.ATCVerdict(result)
+	return healthSignal{Status: status, Details: details}
 }
 
 func (s *Server) collectObjectBoundaries(ctx context.Context, objType, objName, parent string) healthSignal {
@@ -247,77 +239,76 @@ func (s *Server) collectObjectBoundaries(ctx context.Context, objType, objName, 
 	g := graph.New()
 	nodeID := graph.NodeID(objType, objName)
 	g.AddNode(&graph.Node{ID: nodeID, Name: objName, Type: objType})
-	edges := graph.ExtractDepsFromSource(source, nodeID)
-	dynEdges := graph.ExtractDynamicCalls(source, nodeID)
-	for _, e := range append(edges, dynEdges...) {
-		g.AddEdge(e)
-		parts := strings.SplitN(e.To, ":", 2)
-		if len(parts) == 2 {
-			g.AddNode(&graph.Node{ID: e.To, Name: parts[1], Type: parts[0]})
-		}
-	}
-	s.resolvePackages(ctx, g)
+	g.AddSourceDeps(nodeID, source)
+	unresolved := s.resolvePackages(ctx, g)
 	n := g.GetNode(nodeID)
 	if n == nil || n.Package == "" {
-		return healthSignal{Status: "UNKNOWN"}
+		return healthSignal{Status: "UNKNOWN", Unsearched: unresolved, Note: unresolvedPackageNote(unresolved)}
 	}
 	report := g.CheckBoundaries(n.Package, &graph.BoundaryOptions{IncludeDynamic: true})
 	status := "CLEAN"
 	if report.Violations > 0 {
 		status = "VIOLATIONS"
 	}
-	return healthSignal{Status: status, Details: map[string]any{
-		"violations":       report.Violations,
-		"crossed_packages": report.CrossedPackages,
-		"dynamic":          report.Dynamic,
-	}}
+	return healthSignal{
+		Status: status,
+		Details: map[string]any{
+			"violations":       report.Violations,
+			"crossed_packages": report.CrossedPackages,
+			"dynamic":          report.Dynamic,
+		},
+		Unsearched: unresolved,
+		Note:       unresolvedPackageNote(unresolved),
+	}
 }
 
 func (s *Server) collectPackageBoundaries(ctx context.Context, pkg string) healthSignal {
-	g := graph.New()
-	content, err := s.adtClient.GetPackage(ctx, pkg)
+	// The same scan check_boundaries makes. This collector had its own loop,
+	// which took only classes, programs and interfaces and dropped every other
+	// entry without a word — a package of function groups calling across
+	// packages came back with nothing read, or with the classes beside them
+	// read and the groups left out of a verdict that looked complete.
+	scan, err := s.packageGraph(ctx, pkg, 1)
 	if err != nil {
 		return healthSignal{Status: "ERROR", Details: map[string]any{"message": err.Error()}}
 	}
-
-	count := 0
-	for _, obj := range content.Objects {
-		objType := strings.ToUpper(obj.Type)
-		if objType != "CLAS" && objType != "PROG" && objType != "INTF" {
-			continue
-		}
-		if count >= 30 {
-			break
-		}
-		source, err := s.adtClient.GetSource(ctx, objType, obj.Name, nil)
-		if err != nil || source == "" {
-			continue
-		}
-		nodeID := graph.NodeID(objType, obj.Name)
-		g.AddNode(&graph.Node{ID: nodeID, Name: obj.Name, Type: objType, Package: pkg})
-		edges := graph.ExtractDepsFromSource(source, nodeID)
-		dynEdges := graph.ExtractDynamicCalls(source, nodeID)
-		for _, e := range append(edges, dynEdges...) {
-			g.AddEdge(e)
-			parts := strings.SplitN(e.To, ":", 2)
-			if len(parts) == 2 {
-				g.AddNode(&graph.Node{ID: e.To, Name: parts[1], Type: parts[0]})
-			}
-		}
-		count++
-	}
-	s.resolvePackages(ctx, g)
+	g, count, missed, skipped := scan.Graph, scan.Read, scan.Unreadable, scan.Truncated
+	unresolved := s.resolvePackages(ctx, g)
 	report := g.CheckBoundaries(pkg, &graph.BoundaryOptions{IncludeDynamic: true})
 	status := "CLEAN"
 	if report.Violations > 0 {
 		status = "VIOLATIONS"
 	}
-	return healthSignal{Status: status, Details: map[string]any{
+	// Nothing was read at all, so CLEAN would be a verdict on an empty graph.
+	// This is not hypothetical: a package whose listing holds only sub-packages
+	// scans zero objects and used to report "CLEAN, 0 violations", which reads
+	// as a pass.
+	if count == 0 {
+		status = "UNKNOWN"
+		if len(missed) > 0 {
+			status = "ERROR"
+		}
+	}
+	signal := healthSignal{Status: status, Details: map[string]any{
 		"scanned_objects":   count,
 		"violations":        report.Violations,
 		"crossed_packages":  report.CrossedPackages,
 		"violating_objects": report.ViolatingObjects,
 	}}
+	signal.Unsearched = append(missed, unresolved...)
+	signal.Note = joinNotes(
+		adt.UnsearchedNote(missed, count+len(missed), "object"),
+		unresolvedPackageNote(unresolved),
+	)
+	if skipped > 0 {
+		signal.Note = joinNotes(signal.Note, fmt.Sprintf(
+			"only the first %d source-bearing objects were scanned; %d more were not looked at.", scan.Cap, skipped))
+	}
+	if count == 0 {
+		signal.Note = joinNotes(signal.Note,
+			"no source-bearing objects were read in this package, so there is no boundary verdict here — not a clean one.")
+	}
+	return signal
 }
 
 func (s *Server) collectObjectStaleness(ctx context.Context, objType, objName, parent string) healthSignal {
@@ -336,18 +327,31 @@ func (s *Server) collectPackageStaleness(ctx context.Context, pkg string) health
 
 	var newest time.Time
 	checked := 0
+	attempted := 0
+	var missed []adt.Unsearched
 	for _, obj := range content.Objects {
-		objType := strings.ToUpper(obj.Type)
+		objType := adtsource.SourceKind(obj.Type)
 		if objType != "CLAS" && objType != "PROG" && objType != "INTF" {
 			continue
 		}
 		if checked >= 10 {
 			break
 		}
+		attempted++
 		revs, err := s.adtClient.GetRevisions(ctx, objType, obj.Name, nil)
-		if err != nil || len(revs) == 0 {
+		if err != nil {
+			// Staleness is a maximum over dates. An object whose history could
+			// not be read contributes no date, so the answer skews old, and
+			// "this package has not been touched in two years" is precisely the
+			// conclusion someone deletes code on.
+			missed = append(missed, adt.Unsearched{Object: objType + " " + obj.Name, Reason: err.Error()})
 			continue
 		}
+		if len(revs) == 0 {
+			continue
+		}
+		// A date the server sent but we cannot parse is a local decoding
+		// problem, not a failed question, and it is left as it was.
 		tm, err := time.Parse(time.RFC3339, revs[0].Date)
 		if err != nil {
 			continue
@@ -357,37 +361,26 @@ func (s *Server) collectPackageStaleness(ctx context.Context, pkg string) health
 		}
 		checked++
 	}
+	note := adt.UnsearchedNote(missed, attempted, "object")
 	if newest.IsZero() {
-		return healthSignal{Status: "UNKNOWN"}
+		return healthSignal{Status: "UNKNOWN", Unsearched: missed, Note: note}
 	}
-	return stalenessFromTime(newest, checked)
+	signal := stalenessFromTime(newest, checked)
+	signal.Unsearched = missed
+	signal.Note = note
+	return signal
 }
 
+// stalenessFromRevisions and stalenessFromTime wrap the shared verdicts in the
+// MCP signal type.
 func stalenessFromRevisions(revs []adt.Revision) healthSignal {
-	if len(revs) == 0 {
-		return healthSignal{Status: "UNKNOWN"}
-	}
-	tm, err := time.Parse(time.RFC3339, revs[0].Date)
-	if err != nil {
-		return healthSignal{Status: "ERROR", Details: map[string]any{"message": err.Error()}}
-	}
-	return stalenessFromTime(tm, 1)
+	status, details := adtsource.RevisionsVerdict(revs)
+	return healthSignal{Status: status, Details: details}
 }
 
 func stalenessFromTime(tm time.Time, checked int) healthSignal {
-	ageDays := int(time.Since(tm).Hours() / 24)
-	status := "ACTIVE"
-	switch {
-	case ageDays > 365:
-		status = "STALE"
-	case ageDays > 90:
-		status = "AGING"
-	}
-	return healthSignal{Status: status, Details: map[string]any{
-		"last_changed": tm.Format(time.RFC3339),
-		"age_days":     ageDays,
-		"checked":      checked,
-	}}
+	status, details := adtsource.StalenessVerdict(tm, checked)
+	return healthSignal{Status: status, Details: details}
 }
 
 func summarizeHealth(signals map[string]healthSignal) healthSummary {
@@ -403,7 +396,47 @@ func summarizeHealth(signals map[string]healthSignal) healthSummary {
 	if signals["staleness"].Status == "STALE" {
 		return healthSummary{Status: "WARN", Headline: "Object or package appears stale"}
 	}
+	// Everything above is something we found. Below this line the report has
+	// found nothing, and there are two ways to find nothing: because there is
+	// nothing there, and because the looking failed. Only the first of them is
+	// good news, and "No major health issues detected" claims the first while
+	// being true of both.
+	if gaps := incompleteSignalNames(signals); len(gaps) > 0 {
+		return healthSummary{
+			Status:   "UNKNOWN",
+			Headline: "Nothing was found wrong, but " + strings.Join(gaps, " and ") + " could not be checked in full — see notes",
+		}
+	}
 	return healthSummary{Status: "GOOD", Headline: "No major health issues detected"}
+}
+
+// incompleteSignalNames lists, in a stable order, the signals that reached their
+// status without all the evidence.
+func incompleteSignalNames(signals map[string]healthSignal) []string {
+	var names []string
+	for _, name := range []string{"tests", "atc", "boundaries", "staleness"} {
+		if signals[name].incomplete() {
+			names = append(names, name)
+		}
+	}
+	return names
+}
+
+// healthNotes lifts every signal's caveat to the top of the document, prefixed
+// with the signal it belongs to. A reader who trusts the summary and stops
+// there has to meet the gaps on the way.
+func healthNotes(signals map[string]healthSignal) []string {
+	var notes []string
+	for _, name := range []string{"tests", "atc", "boundaries", "staleness"} {
+		sig := signals[name]
+		if sig.Note != "" {
+			notes = append(notes, name+": "+sig.Note)
+		} else if sig.Status == "ERROR" {
+			msg, _ := sig.Details["message"].(string)
+			notes = append(notes, name+": this check failed, so it is not evidence of health. "+msg)
+		}
+	}
+	return notes
 }
 
 func buildHealthObjectURL(objType, objName, parent string) string {

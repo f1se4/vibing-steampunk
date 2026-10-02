@@ -12,15 +12,17 @@ import (
 	"strings"
 
 	"github.com/oisee/vibing-steampunk/pkg/adt"
+	"github.com/oisee/vibing-steampunk/pkg/saprfc"
 	lua "github.com/yuin/gopher-lua"
 )
 
 // LuaEngine wraps a Lua VM with vsp bindings.
 type LuaEngine struct {
-	L      *lua.LState
-	client *adt.Client
-	ctx    context.Context
-	output io.Writer
+	L           *lua.LState
+	client      *adt.Client
+	writeSource func(context.Context, string, string, string, *adt.WriteSourceOptions) (*adt.WriteSourceResult, error)
+	ctx         context.Context
+	output      io.Writer
 
 	// Checkpoints (for Force Replay)
 	checkpoints map[string]map[string]interface{}
@@ -29,6 +31,28 @@ type LuaEngine struct {
 	recorder       *adt.ExecutionRecorder
 	historyManager *adt.HistoryManager
 	isRecording    bool
+
+	// One debug session, held for the life of the script — see
+	// debug_session.go for why a stateless client cannot have one.
+	dbgFactory DebuggerFactory
+	dbg        *saprfc.Debugger
+	dbgRelease func()
+
+	// readOnly refuses the bindings that overwrite variables in a live
+	// program (setVariable, injectCheckpoint, forceReplay, replayFromStep).
+	readOnly bool
+}
+
+// SetReadOnly marks the engine's system read-only. The command line sets it
+// from read_only / SAP_READ_ONLY; the bindings that change a live program's
+// variables are then refused before anything is sent.
+func (e *LuaEngine) SetReadOnly(readOnly bool) { e.readOnly = readOnly }
+
+// checkVariableWrite is the gate for those bindings: a workflow operation, as
+// DebuggerSetVariableValue and the CLI debug REPLs check it.
+func (e *LuaEngine) checkVariableWrite(opName string) error {
+	safety := adt.SafetyConfig{ReadOnly: e.readOnly}
+	return safety.CheckOperation(adt.OpWorkflow, opName)
 }
 
 // NewLuaEngine creates a new Lua engine with ADT client bindings.
@@ -46,6 +70,9 @@ func NewLuaEngine(client *adt.Client) *LuaEngine {
 		ctx:         context.Background(),
 		output:      os.Stdout,
 		checkpoints: make(map[string]map[string]interface{}),
+	}
+	if client != nil {
+		engine.writeSource = client.WriteSource
 	}
 
 	engine.registerBuiltins()
@@ -66,6 +93,7 @@ func (e *LuaEngine) SetOutput(w io.Writer) {
 
 // Close closes the Lua state.
 func (e *LuaEngine) Close() {
+	e.CloseDebugger()
 	e.L.Close()
 }
 
@@ -130,7 +158,7 @@ Search & Source:
   searchObject(query, [type])     Search for ABAP objects
   grepObjects(pattern, [type])    Grep in object sources
   getSource(type, name)           Get source code
-  writeSource(type, name, src)    Write source code
+  writeSource(type, name, src, [options]) Write source (mode, transport, package, description)
   editSource(type, name, old, new) Edit source code
 
 Debugging - Breakpoints:

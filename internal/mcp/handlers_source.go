@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/oisee/vibing-steampunk/pkg/adt"
@@ -16,9 +17,9 @@ import (
 // routeSourceAction routes "read" for GetSource and "edit" for WriteSource/EditSource.
 func (s *Server) routeSourceAction(ctx context.Context, action, objectType, objectName string, params map[string]any) (*mcp.CallToolResult, bool, error) {
 	if action == "read" {
-		// GetSource covers: CLAS, PROG, INTF, FUNC, FUGR, INCL, DDLS, BDEF, SRVD, MSAG, VIEW
+		// GetSource covers: CLAS, PROG, INTF, FUNC, FUGR, INCL, DDLS, BDEF, SRVD, SRVB, MSAG, VIEW, ENHO
 		switch objectType {
-		case "CLAS", "PROG", "INTF", "FUNC", "FUGR", "INCL", "DDLS", "BDEF", "SRVD", "MSAG", "VIEW":
+		case "CLAS", "PROG", "INTF", "FUNC", "FUGR", "INCL", "DDLS", "BDEF", "SRVD", "SRVB", "MSAG", "VIEW", "ENHO":
 			args := map[string]any{
 				"object_type": objectType,
 				"name":        objectName,
@@ -35,6 +36,9 @@ func (s *Server) routeSourceAction(ctx context.Context, action, objectType, obje
 			if v, ok := getBoolParam(params, "include_context"); ok {
 				args["include_context"] = v
 			}
+			if v, ok := getBoolParam(params, "include_hash"); ok {
+				args["include_hash"] = v
+			}
 			if v, ok := getFloatParam(params, "max_deps"); ok {
 				args["max_deps"] = v
 			}
@@ -45,7 +49,7 @@ func (s *Server) routeSourceAction(ctx context.Context, action, objectType, obje
 	if action == "edit" {
 		// High-level WriteSource
 		switch objectType {
-		case "CLAS", "PROG", "INTF", "DDLS", "BDEF", "SRVD", "MSAG":
+		case "CLAS", "PROG", "INTF", "FUNC", "INCL", "DDLS", "BDEF", "SRVD", "MSAG", "TABL":
 			if src := getStringParam(params, "source"); src != "" {
 				args := map[string]any{
 					"object_type": objectType,
@@ -69,6 +73,23 @@ func (s *Server) routeSourceAction(ctx context.Context, action, objectType, obje
 				}
 				if v := getStringParam(params, "method"); v != "" {
 					args["method"] = v
+				}
+				if v := getStringParam(params, "expected_source_hash"); v != "" {
+					args["expected_source_hash"] = v
+				}
+				// CLAS only: the include to write instead of the main source.
+				// Forwarded, never dropped, so WriteSource can route it or
+				// refuse it (#242).
+				if v := getStringParam(params, "include"); v != "" {
+					args["include"] = v
+				}
+				// FUNC only: the group, when the caller happens to know it.
+				if v := getStringParam(params, "parent"); v != "" {
+					args["parent"] = v
+				}
+				// The call's budget; longCall reads and checks it.
+				if v, ok := params["timeout"]; ok {
+					args["timeout"] = v
 				}
 				return s.callHandler(ctx, s.handleWriteSource, args)
 			}
@@ -112,16 +133,19 @@ func (s *Server) registerGetSource() {
 		mcp.WithNumber("max_deps",
 			mcp.Description("Maximum dependencies to resolve when include_context=true (default: 20)"),
 		),
+		mcp.WithBoolean("include_hash",
+			mcp.Description("Return JSON with the raw source and its sourceHash for a guarded later write. Default false preserves the text response."),
+		),
 	), s.handleGetSource)
 }
 
 // registerWriteSource registers the unified WriteSource tool
 func (s *Server) registerWriteSource() {
 	s.mcpServer.AddTool(mcp.NewTool("WriteSource",
-		mcp.WithDescription("Unified tool for writing ABAP source code with automatic create/update detection. Supports PROG, CLAS, INTF, and RAP types (DDLS, BDEF, SRVD)."),
+		mcp.WithDescription("Unified tool for writing ABAP source code with automatic create/update detection. Supports PROG, CLAS, INTF, INCL, and RAP types (DDLS, BDEF, SRVD)."),
 		mcp.WithString("object_type",
 			mcp.Required(),
-			mcp.Description("Object type: PROG (program), CLAS (class), INTF (interface), DDLS (CDS view), BDEF (behavior definition), SRVD (service definition)"),
+			mcp.Description("Object type: PROG (program), CLAS (class), INTF (interface), INCL (include), DDLS (CDS view), BDEF (behavior definition), SRVD (service definition)"),
 		),
 		mcp.WithString("name",
 			mcp.Required(),
@@ -149,6 +173,15 @@ func (s *Server) registerWriteSource() {
 		mcp.WithString("method",
 			mcp.Description("For CLAS only: update only this method (source must be METHOD...ENDMETHOD block). Method must already exist in the class."),
 		),
+		mcp.WithString("expected_source_hash",
+			mcp.Description("Optional sourceHash returned by GetSource(include_hash=true). After locking, refuse the write if SAP source has changed."),
+		),
+		mcp.WithString("include",
+			mcp.Description("For CLAS only: write this include of an existing class instead of the main source: definitions, implementations, macros, testclasses (created if missing). Any other name is refused."),
+		),
+		mcp.WithNumber("timeout",
+			mcp.Description(callTimeoutDescription),
+		),
 	), s.handleWriteSource)
 }
 
@@ -174,10 +207,12 @@ func (s *Server) handleGetSource(ctx context.Context, request mcp.CallToolReques
 		Method:  method,
 	}
 
-	source, err := s.adtClient.GetSource(ctx, objectType, name, opts)
+	rawSource, err := s.adtClient.GetSource(ctx, objectType, name, opts)
 	if err != nil {
 		return newToolResultError(fmt.Sprintf("GetSource failed: %v", err)), nil
 	}
+	source := rawSource
+	contextPrologue := ""
 
 	// Append dependency context (default: true, set include_context=false to disable)
 	includeContext := true
@@ -192,19 +227,40 @@ func (s *Server) handleGetSource(ctx context.Context, request mcp.CallToolReques
 
 		provider := ctxcomp.NewMultiSourceProvider("", &adtSourceAdapter{server: s})
 		compressor := ctxcomp.NewCompressor(provider, maxDeps)
-		result, err := compressor.Compress(ctx, source, name, objectType)
+		result, err := compressor.Compress(ctx, rawSource, name, objectType)
 		if err == nil && result.Prologue != "" {
-			source = source + "\n\n" + result.Prologue +
+			contextPrologue = result.Prologue +
 				fmt.Sprintf("\n* Context stats: %d deps found, %d resolved, %d failed",
 					result.Stats.DepsFound, result.Stats.DepsResolved, result.Stats.DepsFailed)
+			source = rawSource + "\n\n" + contextPrologue
 		}
+	}
+
+	if includeHash, _ := request.GetArguments()["include_hash"].(bool); includeHash {
+		payload := map[string]string{
+			"source":     rawSource,
+			"sourceHash": adt.SourceHash(rawSource),
+		}
+		if contextPrologue != "" {
+			payload["context"] = contextPrologue
+		}
+		output, _ := json.MarshalIndent(payload, "", "  ")
+		return mcp.NewToolResultText(string(output)), nil
 	}
 
 	return mcp.NewToolResultText(source), nil
 }
 
-// handleWriteSource handles the unified WriteSource tool call
+// handleWriteSource handles the unified WriteSource tool call. It is a long
+// call: the PUT of a large source and its activation can run past the
+// client's 60s per-request timeout, and the call's budget (params.timeout or
+// --call-timeout) is what bounds them instead.
 func (s *Server) handleWriteSource(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	return s.longCall(ctx, request, "WriteSource", s.writeSource)
+}
+
+// writeSource is handleWriteSource without the call budget (see longCall).
+func (s *Server) writeSource(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	objectType, ok := request.GetArguments()["object_type"].(string)
 	if !ok || objectType == "" {
 		return newToolResultError("object_type is required"), nil
@@ -226,13 +282,19 @@ func (s *Server) handleWriteSource(ctx context.Context, request mcp.CallToolRequ
 	testSource, _ := request.GetArguments()["test_source"].(string)
 	transport, _ := request.GetArguments()["transport"].(string)
 	method, _ := request.GetArguments()["method"].(string)
+	parent, _ := request.GetArguments()["parent"].(string)
+	expectedSourceHash, _ := request.GetArguments()["expected_source_hash"].(string)
+	include, _ := request.GetArguments()["include"].(string)
 
 	opts := &adt.WriteSourceOptions{
-		Description: description,
-		Package:     packageName,
-		TestSource:  testSource,
-		Transport:   transport,
-		Method:      method,
+		Description:        description,
+		Package:            packageName,
+		Parent:             parent,
+		TestSource:         testSource,
+		Transport:          transport,
+		Method:             method,
+		ExpectedSourceHash: expectedSourceHash,
+		Include:            include,
 	}
 
 	if mode != "" {
@@ -243,9 +305,22 @@ func (s *Server) handleWriteSource(ctx context.Context, request mcp.CallToolRequ
 	if err != nil {
 		return newToolResultError(fmt.Sprintf("WriteSource failed: %v", err)), nil
 	}
+	if err := adt.WriteSourceResultError(result); err != nil {
+		// Fail closed, but do not throw away the diagnosis with the verdict.
+		// The commonest way for this to fail is a syntax error, and
+		// result.SyntaxErrors carries the line, offset and text the caller
+		// needs to fix it. Returning only the message would hand an agent
+		// "Source has syntax errors - not saved" and nothing to act on.
+		payload, _ := json.MarshalIndent(result, "", "  ")
+		return newToolResultError(fmt.Sprintf("%v\n\n%s", err, payload)), nil
+	}
 
 	output, _ := json.MarshalIndent(result, "", "  ")
-	return mcp.NewToolResultText(string(output)), nil
+	res := mcp.NewToolResultText(string(output))
+	if t := strings.ToUpper(objectType); t == "PROG" || t == "PROG/P" || t == "PROGRAM" {
+		res = withHint(res, s.textPoolHint(ctx, adt.TextPoolTarget{Type: "PROG", Name: name}, source))
+	}
+	return res, nil
 }
 
 // registerGrepObjects registers the unified GrepObjects tool
@@ -302,10 +377,10 @@ func (s *Server) registerGrepPackages() {
 // registerImportFromFile registers the ImportFromFile tool (alias for DeployFromFile)
 func (s *Server) registerImportFromFile() {
 	s.mcpServer.AddTool(mcp.NewTool("ImportFromFile",
-		mcp.WithDescription("Import ABAP object from local file into SAP system. Auto-detects object type from file extension, creates or updates, activates. Supports: programs, classes (with includes), interfaces, function groups/modules, CDS views (DDLS), behavior definitions (BDEF), service definitions (SRVD). For class includes (.clas.testclasses.abap, .clas.locals_def.abap, etc.), the parent class must exist."),
+		mcp.WithDescription("Import ABAP object from local file into SAP system. Auto-detects object type from file extension, creates or updates, activates. Supports: programs, includes, classes (with includes), interfaces, function groups/modules, CDS views (DDLS), behavior definitions (BDEF), service definitions (SRVD). For class includes (.clas.testclasses.abap, .clas.locals_def.abap, etc.), the parent class must exist."),
 		mcp.WithString("file_path",
 			mcp.Required(),
-			mcp.Description("Absolute path to ABAP source file. Supported extensions: .prog.abap, .clas.abap, .clas.testclasses.abap, .clas.locals_def.abap, .clas.locals_imp.abap, .intf.abap, .fugr.abap, .func.abap, .ddls.asddls, .bdef.asbdef, .srvd.srvdsrv"),
+			mcp.Description("Absolute path to ABAP source file. Supported extensions: .prog.abap, .incl.abap, .clas.abap, .clas.testclasses.abap, .clas.locals_def.abap, .clas.locals_imp.abap, .intf.abap, .fugr.abap, .func.abap, .ddls.asddls, .bdef.asbdef, .srvd.srvdsrv"),
 		),
 		mcp.WithString("package_name",
 			mcp.Description("Target package name (required for new objects, not needed for class includes)"),
@@ -313,16 +388,22 @@ func (s *Server) registerImportFromFile() {
 		mcp.WithString("transport",
 			mcp.Description("Transport request number"),
 		),
+		mcp.WithString("expected_source_hash",
+			mcp.Description("Optional sourceHash returned by GetSource(include_hash=true). Refuse an existing-object import if SAP source has changed."),
+		),
+		mcp.WithNumber("timeout",
+			mcp.Description(callTimeoutDescription),
+		),
 	), s.handleDeployFromFile) // Reuse existing handler
 }
 
 // registerExportToFile registers the ExportToFile tool (alias for SaveToFile)
 func (s *Server) registerExportToFile() {
 	s.mcpServer.AddTool(mcp.NewTool("ExportToFile",
-		mcp.WithDescription("Export ABAP object from SAP system to local file. Saves source code with appropriate file extension. Supports: programs, classes (with includes), interfaces, function groups/modules, CDS views (DDLS), behavior definitions (BDEF), service definitions (SRVD). For classes, use 'include' parameter to export specific includes (testclasses, definitions, implementations, macros)."),
+		mcp.WithDescription("Export ABAP object from SAP system to local file. Saves source code with appropriate file extension. Supports: programs, includes, classes (with includes), interfaces, function groups/modules, CDS views (DDLS), behavior definitions (BDEF), service definitions (SRVD). For classes, use 'include' parameter to export specific includes (testclasses, definitions, implementations, macros)."),
 		mcp.WithString("object_type",
 			mcp.Required(),
-			mcp.Description("Object type: PROG, CLAS, INTF, FUGR, FUNC, DDLS, BDEF, SRVD"),
+			mcp.Description("Object type: PROG, INCL, CLAS, INTF, FUGR, FUNC, DDLS, BDEF, SRVD"),
 		),
 		mcp.WithString("object_name",
 			mcp.Required(),

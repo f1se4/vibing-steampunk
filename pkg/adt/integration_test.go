@@ -32,10 +32,21 @@ func getIntegrationClient(t *testing.T) *Client {
 		lang = "EN"
 	}
 
+	// 30 s suits a real system. OSD rebuilds and reboots its runtime on every
+	// activation (25-30 s on a CI runner), so a run against it raises this.
+	timeout := 30 * time.Second
+	if s := os.Getenv("VSP_TEST_TIMEOUT"); s != "" {
+		d, err := time.ParseDuration(s)
+		if err != nil {
+			t.Fatalf("VSP_TEST_TIMEOUT=%q: %v", s, err)
+		}
+		timeout = d
+	}
+
 	opts := []Option{
 		WithClient(client),
 		WithLanguage(lang),
-		WithTimeout(30 * time.Second),
+		WithTimeout(timeout),
 	}
 
 	if os.Getenv("SAP_INSECURE") == "true" {
@@ -43,6 +54,18 @@ func getIntegrationClient(t *testing.T) *Client {
 	}
 
 	return NewClient(url, user, pass, opts...)
+}
+
+// integrationPackage is the package the write tests create their throwaway
+// objects in. $TMP on a real system; a target without $TMP (OSD has none,
+// and refuses a create there with "DEVC $TMP does not exist") names a local
+// package of its own in VSP_TEST_PACKAGE, the variable the function-module
+// tests already read.
+func integrationPackage() string {
+	if pkg := os.Getenv("VSP_TEST_PACKAGE"); pkg != "" {
+		return pkg
+	}
+	return "$TMP"
 }
 
 func TestIntegration_SearchObject(t *testing.T) {
@@ -345,7 +368,7 @@ func TestIntegration_CRUD_FullWorkflow(t *testing.T) {
 	// Use a unique test program name with timestamp to avoid conflicts
 	timestamp := time.Now().Unix() % 100000 // Last 5 digits
 	programName := fmt.Sprintf("ZMCP_%05d", timestamp)
-	packageName := "$TMP" // Local package, no transport needed
+	packageName := integrationPackage() // Local package, no transport needed
 	t.Logf("Test program name: %s", programName)
 
 	// Step 1: Create a new program
@@ -472,7 +495,7 @@ func TestIntegration_ClassWithUnitTests(t *testing.T) {
 	// Use a unique test class name with timestamp
 	timestamp := time.Now().Unix() % 100000
 	className := fmt.Sprintf("ZCL_MCP_%05d", timestamp)
-	packageName := "$TMP"
+	packageName := integrationPackage()
 	t.Logf("Test class name: %s", className)
 
 	// Step 1: Create a new class
@@ -642,7 +665,7 @@ func TestIntegration_WriteProgram(t *testing.T) {
 		ObjectType:  ObjectTypeProgram,
 		Name:        programName,
 		Description: "Test for WriteProgram workflow",
-		PackageName: "$TMP",
+		PackageName: integrationPackage(),
 	})
 	if err != nil {
 		t.Fatalf("Failed to create test program: %v", err)
@@ -704,7 +727,7 @@ func TestIntegration_WriteClass(t *testing.T) {
 		ObjectType:  ObjectTypeClass,
 		Name:        className,
 		Description: "Test for WriteClass workflow",
-		PackageName: "$TMP",
+		PackageName: integrationPackage(),
 	})
 	if err != nil {
 		t.Fatalf("Failed to create test class: %v", err)
@@ -777,7 +800,7 @@ WRITE: / lv_message.`, strings.ToLower(programName), timestamp)
 		}
 	}()
 
-	result, err := client.CreateAndActivateProgram(ctx, programName, "Test CreateAndActivateProgram", "$TMP", source, "")
+	result, err := client.CreateAndActivateProgram(ctx, programName, "Test CreateAndActivateProgram", integrationPackage(), source, "")
 	if err != nil {
 		t.Fatalf("CreateAndActivateProgram failed: %v", err)
 	}
@@ -855,7 +878,7 @@ ENDCLASS.`, strings.ToLower(className))
 		}
 	}()
 
-	result, err := client.CreateClassWithTests(ctx, className, "Test CreateClassWithTests", "$TMP", classSource, testSource, "")
+	result, err := client.CreateClassWithTests(ctx, className, "Test CreateClassWithTests", integrationPackage(), classSource, testSource, "")
 	if err != nil {
 		t.Fatalf("CreateClassWithTests failed: %v", err)
 	}
@@ -984,7 +1007,7 @@ WRITE lv_`, programName)
 		ObjectType:  ObjectTypeProgram,
 		Name:        programName,
 		Description: "MCP Code Completion Test",
-		PackageName: "$TMP",
+		PackageName: integrationPackage(),
 	})
 	if err != nil {
 		t.Fatalf("Failed to create test program: %v", err)
@@ -1062,7 +1085,7 @@ lo_descr = cl_abap_typedescr=>describe_by_name( 'STRING' ).`, programName)
 		ObjectType:  ObjectTypeProgram,
 		Name:        programName,
 		Description: "MCP Find Definition Test",
-		PackageName: "$TMP",
+		PackageName: integrationPackage(),
 	})
 	if err != nil {
 		t.Fatalf("Failed to create test program: %v", err)
@@ -1126,7 +1149,7 @@ DATA lo_descr TYPE REF TO cl_abap_classdescr.`, programName)
 		ObjectType:  ObjectTypeProgram,
 		Name:        programName,
 		Description: "MCP Type Hierarchy Test",
-		PackageName: "$TMP",
+		PackageName: integrationPackage(),
 	})
 	if err != nil {
 		t.Fatalf("Failed to create test program: %v", err)
@@ -1188,7 +1211,7 @@ func TestIntegration_CreatePackage(t *testing.T) {
 		ObjectType:  ObjectTypePackage,
 		Name:        packageName,
 		Description: "Test package created via integration test",
-		PackageName: "$TMP", // Packages are created under parent packages
+		PackageName: integrationPackage(), // Packages are created under parent packages
 	})
 	if err != nil {
 		t.Fatalf("Failed to create package: %v", err)
@@ -1240,7 +1263,7 @@ func TestIntegration_EditSource(t *testing.T) {
 		ObjectType:  ObjectTypeProgram,
 		Name:        programName,
 		Description: "Test for EditSource workflow",
-		PackageName: "$TMP",
+		PackageName: integrationPackage(),
 	})
 	if err != nil {
 		t.Fatalf("Failed to create test program: %v", err)
@@ -1510,7 +1533,7 @@ func TestIntegration_RAP_E2E_OData(t *testing.T) {
 	ddlsName := "ZTEST_MCP_I_FLIGHT"
 	srvdName := "ZTEST_MCP_SD_FLIGHT"
 	srvbName := "ZTEST_MCP_SB_FLIGHT"
-	pkg := "$TMP"
+	pkg := integrationPackage()
 
 	// Cleanup function
 	cleanup := func() {
@@ -1814,19 +1837,18 @@ func TestIntegration_DebuggerListener(t *testing.T) {
 	t.Log("Debug listener test completed!")
 }
 
-// TestIntegration_DebugSessionAPIs tests the debug session APIs without a live debuggee.
-// This test verifies the API structure and error handling.
-// For a full debug session test, see the manual test workflow below.
+// This asserts that every debugger call is refused when no debug session is
+// held. That is worth checking, but it is the opposite of debugger coverage,
+// and the name it used to carry — DebugSessionAPIs — read as if a debug session
+// had been driven here. None is: the client under test is the stateless one,
+// which cannot hold the ABAP roll area a debug session lives in, so these calls
+// could not succeed even against a stopped debuggee.
 //
-// Manual Debug Session Test Workflow:
-// 1. Set breakpoint: Use SetExternalBreakpoint on a test program
-// 2. Run code: Execute the test program from SAP GUI or another session
-// 3. Listen: Call DebuggerListen - should catch the debuggee
-// 4. Attach: Call DebuggerAttach with the debuggee ID
-// 5. Inspect: Call DebuggerGetStack and DebuggerGetVariables
-// 6. Step: Call DebuggerStep with DebugStepOver/Into/Return
-// 7. Detach: Call DebuggerDetach to release the debuggee
-func TestIntegration_DebugSessionAPIs(t *testing.T) {
+// What actually exercises the debugger loop — listen, attach, stack, variables,
+// stepping — is the cassette replay in pkg/saprfc, which runs under `go test`
+// with no system at all. See pkg/saprfc/cassette_replay_test.go, and
+// `vsp adt debug --record` for how a cassette is taken from a live system.
+func TestIntegration_StatelessClientRefusesDebugCallsWithoutASession(t *testing.T) {
 	client := getIntegrationClient(t)
 	ctx := context.Background()
 
@@ -1884,15 +1906,5 @@ func TestIntegration_DebugSessionAPIs(t *testing.T) {
 		t.Logf("DebuggerStep correctly returned error: %v", err)
 	}
 
-	t.Log("Debug session API test completed!")
-	t.Log("")
-	t.Log("=== To test a full debug session manually ===")
-	t.Log("1. Set a breakpoint: client.SetExternalBreakpoint(...)")
-	t.Log("2. Run code that hits the breakpoint from another session")
-	t.Log("3. Call client.DebuggerListen to catch the debuggee")
-	t.Log("4. Attach: client.DebuggerAttach(debuggee.ID, user)")
-	t.Log("5. Get stack: client.DebuggerGetStack(true)")
-	t.Log("6. Get variables: client.DebuggerGetChildVariables([]string{\"@ROOT\"})")
-	t.Log("7. Step: client.DebuggerStep(DebugStepOver, \"\")")
-	t.Log("8. Detach: client.DebuggerDetach()")
+	t.Log("All debugger calls were refused without a session, as expected.")
 }

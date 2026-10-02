@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/oisee/vibing-steampunk/embedded/deps"
+	installer "github.com/oisee/vibing-steampunk/internal/install"
 	"github.com/oisee/vibing-steampunk/pkg/adt"
 	"github.com/spf13/cobra"
 )
@@ -25,6 +26,7 @@ func init() {
 	copyCmd.Flags().StringVar(&copyObjectType, "type", "", "Filter by object type (e.g., CLAS, PROG)")
 	copyCmd.Flags().StringVar(&copyObjectName, "name", "", "Filter by object name pattern (e.g., ZCL_*)")
 	copyCmd.Flags().BoolVar(&copyDryRun, "dry-run", false, "Show what would be deployed without deploying")
+	addCallTimeoutFlag(copyCmd)
 	copyCmd.MarkFlagRequired("to")
 
 	rootCmd.AddCommand(copyCmd)
@@ -76,6 +78,10 @@ func runCopy(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
+	budget, err := resolveCallTimeout(cmd)
+	if err != nil {
+		return err
+	}
 	ctx := context.Background()
 
 	// Get ZIP data
@@ -83,17 +89,13 @@ func runCopy(cmd *cobra.Command, args []string) error {
 	var sourceName string
 
 	if copyEmbedded != "" {
-		// Use embedded dependency
-		zipData = deps.GetDependencyZIP(copyEmbedded)
-		if zipData == nil {
-			available := deps.GetAvailableDependencies()
-			var names []string
-			for _, d := range available {
-				if d.Available {
-					names = append(names, d.Name)
-				}
-			}
-			return fmt.Errorf("embedded dependency '%s' not found. Available: %s", copyEmbedded, strings.Join(names, ", "))
+		// Use embedded dependency. RequireDependencyZIP refuses an archive that
+		// is embedded but empty, which a nil check let through — and an empty
+		// archive unpacks to nothing and reports success.
+		var derr error
+		zipData, derr = deps.RequireDependencyZIP(copyEmbedded)
+		if derr != nil {
+			return derr
 		}
 		sourceName = copyEmbedded + " (embedded)"
 	} else {
@@ -144,7 +146,7 @@ func runCopy(cmd *cobra.Command, args []string) error {
 	// Check if ZADT_VSP is available
 	wsAvailable := checkWebSocketAvailable(client, ctx)
 	if wsAvailable {
-		fmt.Println("Mode: WebSocket (ZADT_VSP available - full object type support)")
+		fmt.Println("Mode: ADT Native (ZADT_VSP detected; WebSocket copy deployment is not implemented)")
 	} else {
 		fmt.Println("Mode: ADT Native (fallback - PROG, CLAS, INTF, DDLS, BDEF, SRVD)")
 	}
@@ -154,21 +156,12 @@ func runCopy(cmd *cobra.Command, args []string) error {
 	fmt.Printf("Deployment Plan (%d objects):\n", len(filteredObjects))
 	fmt.Println(strings.Repeat("-", 60))
 
-	adtSupported := map[string]bool{
-		"PROG": true,
-		"CLAS": true,
-		"INTF": true,
-		"DDLS": true,
-		"BDEF": true,
-		"SRVD": true,
-	}
-
 	var deployable, skipped int
 	for _, obj := range filteredObjects {
-		supported := wsAvailable || adtSupported[obj.Type]
+		supported, reason := copyObjectSupported(obj)
 		status := "✓"
 		if !supported {
-			status = "⊘ (requires ZADT_VSP)"
+			status = fmt.Sprintf("⊘ (%s)", reason)
 			skipped++
 		} else {
 			deployable++
@@ -201,17 +194,12 @@ func runCopy(cmd *cobra.Command, args []string) error {
 
 	// Ensure package exists
 	fmt.Printf("Checking package %s...\n", copyToPackage)
-	_, err = client.GetPackage(ctx, copyToPackage)
+	created, err := installer.EnsurePackage(ctx, client, copyToPackage, fmt.Sprintf("Deployed from %s", sourceName))
 	if err != nil {
-		fmt.Printf("Creating package %s...\n", copyToPackage)
-		err = client.CreateObject(ctx, adt.CreateObjectOptions{
-			ObjectType:  adt.ObjectTypePackage,
-			Name:        copyToPackage,
-			Description: fmt.Sprintf("Deployed from %s", sourceName),
-		})
-		if err != nil {
-			return fmt.Errorf("failed to create package: %w", err)
-		}
+		return fmt.Errorf("failed to ensure target package: %w", err)
+	}
+	if created {
+		fmt.Printf("Created and verified package %s\n", copyToPackage)
 	}
 
 	// Deploy objects
@@ -219,14 +207,16 @@ func runCopy(cmd *cobra.Command, args []string) error {
 	var success, failed int
 
 	for _, obj := range filteredObjects {
-		supported := wsAvailable || adtSupported[obj.Type]
+		supported, _ := copyObjectSupported(obj)
 		if !supported {
 			continue
 		}
 
 		fmt.Printf("  Deploying %s %s... ", obj.Type, obj.Name)
 
-		err := deployObject(ctx, client, obj, copyToPackage, wsAvailable)
+		objCtx, cancel := withWriteBudget(ctx, budget)
+		err := deployObject(objCtx, client, obj, copyToPackage)
+		cancel()
 		if err != nil {
 			fmt.Printf("FAILED: %v\n", err)
 			failed++
@@ -239,13 +229,32 @@ func runCopy(cmd *cobra.Command, args []string) error {
 	fmt.Println()
 	fmt.Printf("Deployment complete: %d success, %d failed\n", success, failed)
 
-	if !wsAvailable && skipped > 0 {
-		fmt.Println("\nNote: Some objects were skipped because ZADT_VSP is not installed.")
-		fmt.Println("Install ZADT_VSP first to enable full object type support:")
-		fmt.Println("  vsp -s <system> copy --embedded zadt-vsp --to $ZADT_VSP")
+	if skipped > 0 {
+		fmt.Println("\nNote: Unsupported or incomplete object types were skipped before deployment.")
 	}
 
-	return nil
+	return deploymentSummaryError(failed, skipped)
+}
+
+func deploymentSummaryError(failed, skipped int) error {
+	if failed == 0 && skipped == 0 {
+		return nil
+	}
+	return fmt.Errorf("deployment incomplete: %d failed and %d skipped object(s)", failed, skipped)
+}
+
+func copyObjectSupported(obj deps.DeploymentObject) (bool, string) {
+	switch obj.Type {
+	case "PROG", "INTF", "DDLS", "BDEF", "SRVD":
+		return true, ""
+	case "CLAS": //nolint:misspell // CLAS is the SAP object type.
+		if len(obj.Includes) > 0 {
+			return false, "class include deployment is not implemented"
+		}
+		return true, ""
+	default:
+		return false, "object type is not supported by ADT copy deployment"
+	}
 }
 
 // checkWebSocketAvailable tests if ZADT_VSP WebSocket is available.
@@ -258,13 +267,8 @@ func checkWebSocketAvailable(client *adt.Client, ctx context.Context) bool {
 	return results[0].Name == "ZCL_VSP_APC_HANDLER"
 }
 
-// deployObject deploys a single object using ADT native or WebSocket.
-func deployObject(ctx context.Context, client *adt.Client, obj deps.DeploymentObject, packageName string, useWebSocket bool) error {
-	if useWebSocket {
-		// TODO: Implement WebSocket-based deployment
-		// For now, fall through to ADT native
-	}
-
+// deployObject deploys a single object using ADT native.
+func deployObject(ctx context.Context, client *adt.Client, obj deps.DeploymentObject, packageName string) error {
 	// ADT Native deployment
 	switch obj.Type {
 	case "PROG":
@@ -299,36 +303,26 @@ func deployProgram(ctx context.Context, client *adt.Client, obj deps.DeploymentO
 	if err != nil {
 		return err
 	}
-	if !result.Success {
-		return fmt.Errorf("WriteSource failed: %s", result.Message)
-	}
-	return nil
+	return adt.WriteSourceResultReport(result)
 }
 
 func deployClass(ctx context.Context, client *adt.Client, obj deps.DeploymentObject, packageName string) error {
+	if len(obj.Includes) > 0 {
+		return fmt.Errorf("class include deployment is not implemented; refusing partial deployment")
+	}
 	desc := obj.Description
 	if desc == "" {
 		desc = fmt.Sprintf("Deployed: %s", obj.Name)
 	}
 	// Deploy main class
-	_, err := client.WriteSource(ctx, "CLAS", obj.Name, obj.MainSource, &adt.WriteSourceOptions{
+	result, err := client.WriteSource(ctx, "CLAS", obj.Name, obj.MainSource, &adt.WriteSourceOptions{ //nolint:misspell // CLAS is the SAP object type.
 		Package:     packageName,
 		Description: desc,
 	})
 	if err != nil {
 		return err
 	}
-
-	// Deploy includes (TODO: implement include deployment)
-	if len(obj.Includes) > 0 {
-		var incTypes []string
-		for t := range obj.Includes {
-			incTypes = append(incTypes, t)
-		}
-		fmt.Printf("\n    Note: class includes [%s] not yet deployed (TODO)\n", strings.Join(incTypes, ","))
-	}
-
-	return nil
+	return adt.WriteSourceResultReport(result)
 }
 
 func deployInterface(ctx context.Context, client *adt.Client, obj deps.DeploymentObject, packageName string) error {
@@ -336,11 +330,14 @@ func deployInterface(ctx context.Context, client *adt.Client, obj deps.Deploymen
 	if desc == "" {
 		desc = fmt.Sprintf("Deployed: %s", obj.Name)
 	}
-	_, err := client.WriteSource(ctx, "INTF", obj.Name, obj.MainSource, &adt.WriteSourceOptions{
+	result, err := client.WriteSource(ctx, "INTF", obj.Name, obj.MainSource, &adt.WriteSourceOptions{
 		Package:     packageName,
 		Description: desc,
 	})
-	return err
+	if err != nil {
+		return err
+	}
+	return adt.WriteSourceResultReport(result)
 }
 
 func deployDDLS(ctx context.Context, client *adt.Client, obj deps.DeploymentObject, packageName string) error {
@@ -348,11 +345,14 @@ func deployDDLS(ctx context.Context, client *adt.Client, obj deps.DeploymentObje
 	if desc == "" {
 		desc = fmt.Sprintf("Deployed: %s", obj.Name)
 	}
-	_, err := client.WriteSource(ctx, "DDLS", obj.Name, obj.MainSource, &adt.WriteSourceOptions{
+	result, err := client.WriteSource(ctx, "DDLS", obj.Name, obj.MainSource, &adt.WriteSourceOptions{
 		Package:     packageName,
 		Description: desc,
 	})
-	return err
+	if err != nil {
+		return err
+	}
+	return adt.WriteSourceResultReport(result)
 }
 
 func deployBDEF(ctx context.Context, client *adt.Client, obj deps.DeploymentObject, packageName string) error {
@@ -360,11 +360,14 @@ func deployBDEF(ctx context.Context, client *adt.Client, obj deps.DeploymentObje
 	if desc == "" {
 		desc = fmt.Sprintf("Deployed: %s", obj.Name)
 	}
-	_, err := client.WriteSource(ctx, "BDEF", obj.Name, obj.MainSource, &adt.WriteSourceOptions{
+	result, err := client.WriteSource(ctx, "BDEF", obj.Name, obj.MainSource, &adt.WriteSourceOptions{
 		Package:     packageName,
 		Description: desc,
 	})
-	return err
+	if err != nil {
+		return err
+	}
+	return adt.WriteSourceResultReport(result)
 }
 
 func deploySRVD(ctx context.Context, client *adt.Client, obj deps.DeploymentObject, packageName string) error {
@@ -372,9 +375,12 @@ func deploySRVD(ctx context.Context, client *adt.Client, obj deps.DeploymentObje
 	if desc == "" {
 		desc = fmt.Sprintf("Deployed: %s", obj.Name)
 	}
-	_, err := client.WriteSource(ctx, "SRVD", obj.Name, obj.MainSource, &adt.WriteSourceOptions{
+	result, err := client.WriteSource(ctx, "SRVD", obj.Name, obj.MainSource, &adt.WriteSourceOptions{
 		Package:     packageName,
 		Description: desc,
 	})
-	return err
+	if err != nil {
+		return err
+	}
+	return adt.WriteSourceResultReport(result)
 }

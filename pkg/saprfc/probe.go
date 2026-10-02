@@ -16,13 +16,13 @@ import (
 // ADT cannot answer the last one at all; RFC_SIMULATE_AUTH_CHECK can, without
 // executing anything.
 type Probe struct {
-	Destination Destination         `json:"destination"`
-	System      SystemInfo          `json:"system"`
-	Components  []Component         `json:"components,omitempty"`
-	Helpers     map[string]bool     `json:"helpers"`
-	Authorized  map[string]bool     `json:"authorized,omitempty"`
-	Timings     map[string]string   `json:"timings"`
-	Warnings    []string            `json:"warnings,omitempty"`
+	Destination Destination       `json:"destination"`
+	System      SystemInfo        `json:"system"`
+	Components  []Component       `json:"components,omitempty"`
+	Helpers     map[string]bool   `json:"helpers"`
+	Authorized  map[string]bool   `json:"authorized,omitempty"`
+	Timings     map[string]string `json:"timings"`
+	Warnings    []string          `json:"warnings,omitempty"`
 }
 
 // Destination records where the probe went, so a saved report is unambiguous.
@@ -222,7 +222,12 @@ func yesNo(v bool) string {
 	return "no"
 }
 
-func str(v any) string { return strings.TrimSpace(fmt.Sprint(v)) }
+func str(v any) string {
+	if v == nil {
+		return "" // a field the result does not carry, not the word "<nil>"
+	}
+	return strings.TrimSpace(fmt.Sprint(v))
+}
 
 func took(start time.Time) string { return fmt.Sprintf("%dms", time.Since(start).Milliseconds()) }
 

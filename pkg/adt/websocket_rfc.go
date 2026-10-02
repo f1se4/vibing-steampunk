@@ -11,13 +11,20 @@ import (
 
 // RFCResult contains the result of an RFC call.
 type RFCResult struct {
-	Subrc   int            `json:"subrc"`
+	Subrc int `json:"subrc"`
+	// Message is the system message behind a non-zero subrc, when the
+	// function raised one.
+	Message string         `json:"message,omitempty"`
 	Exports map[string]any `json:"exports"`
 	Tables  map[string]any `json:"tables"`
 }
 
-// CallRFC calls a function module via WebSocket.
-func (c *DebugWebSocketClient) CallRFC(ctx context.Context, function string, params map[string]string) (*RFCResult, error) {
+// CallRFC calls a function module through ZADT_VSP's CALL FUNCTION
+// bridge — any function module, remote-enabled or not. A string value
+// goes to an elementary parameter as given (present and empty sets it to
+// initial, which is how a default of 'X' is turned off); a map or slice
+// goes to a structure or table as JSON, deserialized on the ABAP side.
+func (c *DebugWebSocketClient) CallRFC(ctx context.Context, function string, params map[string]any) (*RFCResult, error) {
 	if !c.IsConnected() {
 		return nil, fmt.Errorf("not connected")
 	}
@@ -151,7 +158,7 @@ type MoveObjectResult struct {
 }
 
 // MoveObject moves an ABAP object to a different package via WebSocket.
-// Uses the rfc domain's moveToPackage action which calls ZADT_CL_TADIR_MOVE.
+// Uses the rfc domain's moveToPackage action which calls ZCL_VSP_TADIR_MOVE.
 // objectType: CLAS, PROG, INTF, FUGR, etc.
 // objectName: Name of the object (e.g., ZCL_TEST)
 // newPackage: Target package (e.g., $ZRAY)

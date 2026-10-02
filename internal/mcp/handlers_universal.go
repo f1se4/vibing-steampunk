@@ -19,7 +19,8 @@ func (s *Server) registerUniversalTool() {
 		mcp.WithDescription(`SAP ABAP development: read/edit/create/test/analyze/debug objects on a live SAP system.
 
 common target types: CLAS, PROG, INTF, FUNC, FUGR, DDLS, TABL, DEVC, BDEF, SRVD
-actions: read, edit, create, delete, search, query, grep, test, analyze, debug, system, rfc, help
+actions: read, edit, create, delete, search, query, grep, test, analyze, debug, system, rfc, i18n, revisions, lint, info, help
+SAP() with no arguments — which build, whether the session is authenticated, which system, and what to call next
 some actions (analyze, test, debug, system, help) use params only — no target needed.
 
 SAP(action="read", target="CLAS ZCL_TEST")  — source + dependency context
@@ -31,11 +32,11 @@ SAP(action="analyze", params={"type": "check_boundaries", "package": "$ZDEV"})
 SAP(action="rfc", params={"op":"info"}) — classic RFC to the same system (gateway, not ADT)
 SAP(action="rfc", target="Z_DOUBLE", params={"op":"call","args":{"N":21}}) — call any RFC-enabled FM
 SAP(action="rfc", target="STFC_CONNECTION") — describe an FM interface (JSON Schema)
-  rfc ops: info, ping, describe, call, search, read_table; destination overrides: host, sysnr, port, user
+  rfc ops: info, ping, describe, call, search, read_table, run (report as background job: spool, job log), job; the server's own gateway only (param user picks the logon)
 SAP(action="help") — full docs; SAP(action="help", target="tips") — best practices`),
 		mcp.WithString("action",
 			mcp.Required(),
-			mcp.Description("Action to perform: read, edit, create, delete, search, query, grep, test, analyze, debug, system, rfc, help"),
+			mcp.Description("Action to perform: read, edit, create, delete, search, query, grep, test, analyze, debug, system, rfc, i18n, revisions, lint, info, help. Call SAP() with no arguments for build, connection and system, plus what to call next."),
 		),
 		mcp.WithString("target",
 			mcp.Description("Target object as 'TYPE NAME' (e.g. 'CLAS ZCL_TEST', 'PROG ZREPORT'). Some actions don't need a target."),
@@ -49,10 +50,16 @@ SAP(action="help") — full docs; SAP(action="help", target="tips") — best pra
 // handleUniversalTool dispatches universal SAP(action, target, params) calls to domain-specific route functions.
 func (s *Server) handleUniversalTool(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	action, _ := request.GetArguments()["action"].(string)
-	if action == "" {
-		return newToolResultError("action is required. Use SAP(action=\"help\") for documentation."), nil
+	action = strings.ToLower(strings.TrimSpace(action))
+
+	// An empty call is a question, not a mistake. It used to be answered with
+	// "action is required" and one thing to try, which is correct and is the
+	// least useful correct answer available: the caller sending no arguments is
+	// exactly the caller who does not yet know what this is connected to,
+	// whether the session works, or which build is answering.
+	if action == "" || action == "info" {
+		return s.handleInfo(ctx), nil
 	}
-	action = strings.ToLower(action)
 
 	target, _ := request.GetArguments()["target"].(string)
 
@@ -66,6 +73,8 @@ func (s *Server) handleUniversalTool(ctx context.Context, request mcp.CallToolRe
 	if action == "help" {
 		return handleHelp(target), nil
 	}
+
+	target, params = queryTargetSQL(action, target, params)
 
 	// Parse target into type and name
 	objectType, objectName := parseTarget(target)
@@ -87,6 +96,10 @@ func (s *Server) handleUniversalTool(ctx context.Context, request mcp.CallToolRe
 		s.routeFileIOAction,
 		s.routeDebuggerAction,
 		s.routeDebuggerLegacyAction,
+		// The ADT-native route is tried first: it needs nothing installed on
+		// the server and its breakpoints fire, which the WebSocket route's
+		// never did.
+		s.routeAMDPADTAction,
 		s.routeAMDPAction,
 		s.routeUI5Action,
 		s.routeTransportAction,
@@ -98,9 +111,20 @@ func (s *Server) handleUniversalTool(ctx context.Context, request mcp.CallToolRe
 		s.routeDumpsAction,
 		s.routeTracesAction,
 		s.routeSQLTraceAction,
+		// Before the analysis router, and this is the whole reason
+		// `analyze type=lint` did not work: routeAnalysisAction claims every
+		// action="analyze" and answers "no router claims this type" for one it
+		// does not know, so a router placed after it never sees the call. The
+		// lint router declines everything that is not lint, so sitting earlier
+		// costs the others nothing.
+		s.routeLintAction,
 		s.routeAnalysisAction,
 		s.routeContextAction,
 		s.routeServiceBindingAction,
+		// The last eleven capabilities that were registered as tools and
+		// reachable through no action. See handlers_route_eleven.go.
+		s.routeI18nAction,
+		s.routeRevisionsAction,
 	}
 
 	for _, route := range routes {
@@ -129,6 +153,61 @@ func parseTarget(target string) (objectType, objectName string) {
 		objectName = strings.ToUpper(strings.TrimSpace(parts[1]))
 	}
 	return
+}
+
+// queryTargetSQL lets a query carry its SQL in target instead of params. The
+// raw text is kept: parseTarget upper-cases, which would corrupt string
+// literals in the statement. Other actions pass through unchanged.
+func queryTargetSQL(action, target string, params map[string]any) (string, map[string]any) {
+	if action != "query" || !looksLikeSQL(target) {
+		return target, params
+	}
+	// A statement passed explicitly in params, under any of the names the
+	// query route accepts, wins over one that happens to be in target.
+	if firstParam(params, "sql_query", "sql", "query", "statement") == "" {
+		params = copyParams(params)
+		params["sql_query"] = strings.TrimSpace(target)
+	}
+	// Either way the target has served its purpose and must not reach
+	// parseTarget, which would split "SELECT * FROM T000" into a type and a
+	// name and match nothing.
+	return "SQL", params
+}
+
+// looksLikeSQL reports whether a target string is a SQL statement rather than
+// an object reference.
+func looksLikeSQL(target string) bool {
+	fields := strings.Fields(strings.ToUpper(strings.TrimSpace(target)))
+	if len(fields) < 2 {
+		return false
+	}
+	switch fields[0] {
+	case "SELECT", "WITH":
+		return true
+	}
+	return false
+}
+
+// paramsWithAlias returns params with dst filled from the first non-empty
+// alias, so a handler never drops an argument that arrived under one of the
+// other documented names. The input map is left untouched.
+func paramsWithAlias(params map[string]any, dst string, aliases ...string) map[string]any {
+	if getStringParam(params, dst) != "" {
+		return params
+	}
+	for _, alias := range aliases {
+		v := getStringParam(params, alias)
+		if v == "" {
+			continue
+		}
+		out := make(map[string]any, len(params)+1)
+		for k, val := range params {
+			out[k] = val
+		}
+		out[dst] = v
+		return out
+	}
+	return params
 }
 
 // getObject extracts a nested object (map[string]any) from args.

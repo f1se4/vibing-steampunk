@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/oisee/open-rfc-go/rfc"
+	"github.com/oisee/vibing-steampunk/pkg/adt"
 )
 
 // The debugger's session half — listen, attach, step, stack — only works when
@@ -26,8 +27,55 @@ const FacadeFunction = "ZADT_DEBUG_RFC"
 
 // Debugger drives the ABAP debugger over one pinned RFC conversation.
 type Debugger struct {
-	session *rfc.Session
+	session *rfc.Session // nil when the debugger runs over HTTPS
+	adt     ADTTransport
 	user    string
+	// engaged records that this session listened or attached, and therefore has
+	// something to tear down. It is not bookkeeping for its own sake: detach
+	// calls STOP_LISTENER_FOR_USER, which ends external debugging for the user
+	// and takes the external breakpoints with it. A session that only set
+	// breakpoints must close without it, or it deletes its own work — which is
+	// exactly what `vsp rfc debug -c "bp …"` did until this existed.
+	engaged bool
+	// How this session registered its ADT listener, kept so the teardown can
+	// name the same triple back.
+	listenUser, ideID, terminalID string
+	// The breakpoints this session posted. ADT's breakpoint resource does not
+	// answer a GET, so the client is the only record of its own set — and one
+	// is needed, because a POST replaces the set rather than adding to it.
+	bpSet []adt.Breakpoint
+	// The lines of the last set that SAP refused, with its reason on each.
+	bpRejects []adt.Breakpoint
+	// Whether breakpoints in SAP's own code are allowed to fire at all.
+	systemDebugging bool
+	// The AMDP debug session started on this connection, if any. It cannot
+	// outlive the connection: the ADT resource keeps its handles in class-data,
+	// which is ABAP session memory.
+	amdpMain string
+	// What SAP last said about the AMDP breakpoints it was given. Kept because
+	// the answer arrives on the way to waiting for a stop and would otherwise
+	// be skipped past unseen.
+	amdpLastBreakpointState, amdpLastBreakpointError string
+	// AMDPOnAck is called for each acknowledgement drained on the way to a
+	// stop. Reading the state only after the wait returns tells you nothing
+	// when the wait is cut short — which is the case where you most need to
+	// know whether the breakpoint was ever armed.
+	AMDPOnAck func(kind, state, reason string)
+	// What the most recent table expansion actually read.
+	lastTableSample *TableSample
+	// The hierarchy roots that hold a stopped frame's variables here, learned
+	// once. Releases disagree on the name — @LOCALS on some, @GLOBALS plus
+	// @PARAMETERS on others — and a batched capture cannot spend a round trip
+	// per statement rediscovering it.
+	localsRoots []string
+	// Which shape this system answers the call stack in, learned on the first
+	// read. Releases before the dedicated resource existed answer the
+	// dispatcher instead, and the difference costs one 404 to discover — once
+	// per session rather than once per step.
+	stackShape stackShape
+	// Numbers the multipart boundaries so two batches on one session cannot
+	// collide.
+	batchSeq int
 }
 
 // NewDebugger pins a connection out of the pool and keeps it until Close. The
@@ -37,17 +85,47 @@ func NewDebugger(ctx context.Context, c *rfc.Client, user string) (*Debugger, er
 	if err != nil {
 		return nil, fmt.Errorf("pinning a connection for the debug session: %w", err)
 	}
-	return &Debugger{session: session, user: strings.ToUpper(strings.TrimSpace(user))}, nil
+	d := &Debugger{session: session, user: strings.ToUpper(strings.TrimSpace(user))}
+	d.adt = RFCTunnel(session)
+	return d, nil
+}
+
+// NewADTDebugger drives the debugger over ADT's own resources on some other
+// transport — in practice a stateful HTTPS session, for systems that have no
+// RFC channel. The ZADT_DEBUG facade operations are unavailable there, because
+// they are function modules; everything named ADT* works unchanged.
+func NewADTDebugger(transport ADTTransport, user string) *Debugger {
+	return &Debugger{adt: transport, user: strings.ToUpper(strings.TrimSpace(user))}
 }
 
 // Close releases the pinned connection. It first tries to leave the system
 // tidy: an attached debuggee and a registered listener both outlive the
 // conversation otherwise, and a stale ABDBG_LISTENER row blocks the next attach.
 func (d *Debugger) Close(ctx context.Context) error {
+	// An AMDP session holds something scarcer than a listener row: a debug work
+	// process, and the pool of those is shared across the whole system rather
+	// than per user. A session that goes away without giving one back leaves it
+	// held, and — because stopExisting only reaches your own user — nobody else
+	// can take it back. The next AMDP debugger on the system, under any user,
+	// gets DEBUGGER_NO_MORE_DBG_WPS and no way to fix it.
+	//
+	// So this comes first and its failure is not allowed to skip the rest.
+	if d.amdpMain != "" {
+		_ = d.AMDPTerminate(ctx, true)
+	}
+
 	if d.session == nil {
+		// No pooled connection to give back — but an ADT-only session still owns
+		// a debuggee and a listener row on the server, and nothing else will
+		// release them.
+		if d.engaged {
+			_ = d.ADTDetach(ctx)
+		}
 		return nil
 	}
-	_, _ = d.Detach(ctx)
+	if d.engaged {
+		_, _ = d.Detach(ctx)
+	}
 	err := d.session.Close()
 	d.session = nil
 	return err
@@ -56,7 +134,8 @@ func (d *Debugger) Close(ctx context.Context) error {
 // Op runs one facade operation and returns its JSON payload.
 func (d *Debugger) Op(ctx context.Context, op string, args rfc.Params) (json.RawMessage, error) {
 	if d.session == nil {
-		return nil, fmt.Errorf("the debug session is closed")
+		return nil, fmt.Errorf("%s needs the ZADT_DEBUG facade, which is a function "+
+			"module — this session speaks ADT only. Use the ADT operations instead", op)
 	}
 	params := rfc.Params{"I_OP": op}
 	if d.user != "" {
@@ -92,10 +171,10 @@ func (d *Debugger) Op(ctx context.Context, op string, args rfc.Params) (json.Raw
 // the roll area is the pinned conversation, so the standard surface should work
 // with no Z code at all — the open question this makes testable.
 func (d *Debugger) ADT(ctx context.Context, method, uri string, headers []ADTHeader, body []byte) (*ADTResponse, error) {
-	if d.session == nil {
+	if d.adt == nil {
 		return nil, fmt.Errorf("the debug session is closed")
 	}
-	return CallADTOn(ctx, d.session, ADTRequest{Method: method, URI: uri, Headers: headers, Body: body})
+	return d.adt.Do(ctx, ADTRequest{Method: method, URI: uri, Headers: headers, Body: body})
 }
 
 // State returns the facade's view of this session: which roll area it landed
@@ -147,6 +226,7 @@ func (d *Debugger) DeleteBreakpoints(ctx context.Context, program string, line i
 // conversation for its whole duration, so the client call timeout has to be
 // longer than the ABAP timeout — see rfctool.OpenWithTimeout.
 func (d *Debugger) Listen(ctx context.Context, timeoutSeconds int) (json.RawMessage, error) {
+	d.engaged = true
 	return d.Op(ctx, "listen", rfc.Params{"I_TIMEOUT": timeoutSeconds})
 }
 
@@ -195,6 +275,7 @@ func (d *Debugger) ListenAndAttach(ctx context.Context, timeoutSeconds int) (*Wa
 
 // Attach binds this session to a waiting debuggee and reports where it stopped.
 func (d *Debugger) Attach(ctx context.Context, debuggeeID string) (json.RawMessage, error) {
+	d.engaged = true
 	return d.Op(ctx, "attach", rfc.Params{"I_DEBUGGEE_ID": debuggeeID})
 }
 

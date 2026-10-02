@@ -4,13 +4,18 @@ package mcp
 import (
 	"context"
 	"crypto/subtle"
+	"errors"
 	"fmt"
+	"github.com/oisee/vibing-steampunk/pkg/cache"
+	"io"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
+	"os/signal"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/mark3labs/mcp-go/mcp"
@@ -36,15 +41,24 @@ type Server struct {
 	adtClient     *adt.Client
 	amdpWSClient  *adt.AMDPWebSocketClient  // WebSocket-based AMDP client (ZADT_VSP)
 	debugWSClient *adt.DebugWebSocketClient // WebSocket-based debug client (ZADT_VSP)
-	config        *Config                   // Server configuration for session manager creation
-	featureProber *adt.FeatureProber        // Feature detection system (safety network)
-	featureConfig adt.FeatureConfig         // Feature configuration
+	// transportWS, when set, replaces ZADT_VSP's transport domain (tests).
+	transportWS func(ctx context.Context) (adt.TransportService, error)
+	// gitWS, when set, replaces ZADT_VSP's git domain (tests).
+	gitWS         func(ctx context.Context) (adt.GitService, error)
+	config        *Config            // Server configuration for session manager creation
+	featureProber *adt.FeatureProber // Feature detection system (safety network)
+	featureConfig adt.FeatureConfig  // Feature configuration
 
 	// Shared classic-RFC client (lazily dialled, reused across tool calls, and
 	// pinged while idle so a gateway timeout does not kill it)
 	rfcMu       sync.Mutex
 	rfcShared   *openrfc.Client
 	rfcLastUsed time.Time
+
+	// The one debug session this server holds across tool calls (see
+	// handlers_debug_session.go); nil until the first debugger call.
+	debugMu   sync.Mutex
+	debugSess *debugSession
 
 	// Async task management
 	asyncTasks   map[string]*AsyncTask
@@ -64,6 +78,13 @@ type Config struct {
 
 	// Cookie authentication (alternative to basic auth)
 	Cookies map[string]string
+
+	// Build names the binary, as "v2.52.0 (commit abc1234, built ...)".
+	//
+	// It is a string the caller composes rather than three fields, because the
+	// only thing this package does with it is print it, and three fields would
+	// be three chances for one of them to go unset.
+	Build string
 
 	// Verbose output
 	Verbose bool
@@ -86,6 +107,9 @@ type Config struct {
 	TransportReadOnly       bool     // Only allow read operations on transports (list, get)
 	AllowedTransports       []string // Whitelist specific transports (supports wildcards like "A4HK*")
 	AllowTransportableEdits bool     // Allow editing objects that require transport requests
+	TransportChoice         string   // auto (default): pick a request for a write that names none; off: leave it to SAP
+	CTSProject              string   // CTS project a request vsp creates is filed under
+	TransportTarget         string   // transport target of a request vsp creates
 
 	// Feature configuration (safety network)
 	// Values: "auto" (default, probe system), "on" (force enabled), "off" (force disabled)
@@ -99,12 +123,32 @@ type Config struct {
 	// Graph / co-change configuration
 	TransportAttribute string // E070A attribute name for CR-level co-change aggregation
 
+	// SystemName is this server's system in .vsp.json (-s / SAP_SYSTEM). Empty
+	// finds it by URL and client; its per-system settings (the RFC gateway and
+	// credentials) apply to this server only.
+	SystemName string
+
 	// Debugger configuration
 	TerminalID string // SAP GUI terminal ID for cross-tool breakpoint sharing
 
 	// ReauthFunc is called on 401 to re-authenticate (e.g., re-run SAML dance).
 	// Returns fresh cookies. Passed through to adt.Config.
 	ReauthFunc func(ctx context.Context) (map[string]string, error)
+
+	// ReauthReadOnly limits the re-auth function to unlocked GET/HEAD reads.
+	// Set for credential sources another process refreshes (--cookie-file):
+	// writes and lock windows must fail instead of replaying on a new session.
+	ReauthReadOnly bool
+
+	// ReauthTimeout caps one re-authentication attempt. Zero uses the client
+	// default, which assumes the flow runs unattended; a browser sign-in that
+	// stops to ask for a second factor needs considerably longer.
+	ReauthTimeout time.Duration
+
+	// CallTimeout is the default budget of one long call (ExecuteABAP, ABAP
+	// Unit, a deploy, a source write, an activation) when the call names none in params.timeout. Zero leaves
+	// each request to SAP bounded by the client's per-request timeout only.
+	CallTimeout time.Duration
 
 	// Session keep-alive interval (0 = disabled)
 	// Sends periodic pings to prevent session timeout during idle periods.
@@ -123,6 +167,20 @@ type Config struct {
 }
 
 // NewServer creates a new MCP server for ABAP ADT tools.
+// mcpServerOptions are the options every vsp MCP server is built with.
+//
+// WithRecovery is there because one tool handler panicking used to take the
+// whole server with it: the client lost every tool at once, mid-session, for
+// what was a bug in a single call (issue #237 was a parser recursion that did
+// exactly that). Recovered, the panic becomes an error on that one call.
+func mcpServerOptions() []server.ServerOption {
+	return []server.ServerOption{
+		server.WithResourceCapabilities(true, true),
+		server.WithLogging(),
+		server.WithRecovery(),
+	}
+}
+
 func NewServer(cfg *Config) *Server {
 	// Create ADT client
 	opts := []adt.Option{
@@ -140,6 +198,12 @@ func NewServer(cfg *Config) *Server {
 	}
 	if cfg.ReauthFunc != nil {
 		opts = append(opts, adt.WithReauthFunc(cfg.ReauthFunc))
+		if cfg.ReauthReadOnly {
+			opts = append(opts, adt.WithReadOnlyReauth())
+		}
+	}
+	if cfg.ReauthTimeout > 0 {
+		opts = append(opts, adt.WithReauthTimeout(cfg.ReauthTimeout))
 	}
 
 	// Configure safety settings
@@ -171,10 +235,50 @@ func NewServer(cfg *Config) *Server {
 	if cfg.AllowTransportableEdits {
 		safety.AllowTransportableEdits = true
 	}
+	if cfg.TransportChoice != "" {
+		safety.TransportChoice = cfg.TransportChoice
+	}
 	opts = append(opts, adt.WithSafety(safety))
+	if cfg.CTSProject != "" {
+		opts = append(opts, adt.WithCTSProject(cfg.CTSProject))
+	}
+	if cfg.TransportTarget != "" {
+		opts = append(opts, adt.WithTransportTarget(cfg.TransportTarget))
+	}
+
+	// VSP_CACHE=true keeps GET answers for VSP_CACHE_TTL (10m by default),
+	// in memory for the life of the server; VSP_CACHE_PATH puts them on
+	// SQLite instead. Any write through the client empties it.
+	if strings.EqualFold(os.Getenv("VSP_CACHE"), "true") {
+		ttl := adt.DefaultCacheTTL
+		if raw := strings.TrimSpace(os.Getenv("VSP_CACHE_TTL")); raw != "" {
+			if d, err := time.ParseDuration(raw); err == nil && d > 0 {
+				ttl = d
+			}
+		}
+		if path := strings.TrimSpace(os.Getenv("VSP_CACHE_PATH")); path != "" {
+			if store, err := cache.NewResponseStore(path); err == nil {
+				opts = append(opts, adt.WithCacheStore(store, ttl))
+			} else {
+				opts = append(opts, adt.WithCache(ttl))
+			}
+		} else {
+			opts = append(opts, adt.WithCache(ttl))
+		}
+	}
 
 	adtClient := adt.NewClient(cfg.BaseURL, cfg.Username, cfg.Password, opts...)
+	return NewServerWithClient(cfg, adtClient)
+}
 
+// NewServerWithClient builds a server around a client the caller already holds.
+//
+// The CLI resolves a system into a client of its own — carrying that system's
+// cookies, its browser single sign-on with the refresh hook attached, and its
+// declared safety — and none of that survives a round trip through Config.
+// `vsp sweep` has to call handlers through the real dispatch path on the real
+// connection, so it hands the client over rather than describing it.
+func NewServerWithClient(cfg *Config, adtClient *adt.Client) *Server {
 	// Set terminal ID for debugger operations
 	// Priority: 1) Custom ID (SAP GUI), 2) User-based ID
 	if cfg.TerminalID != "" {
@@ -196,12 +300,7 @@ func NewServer(cfg *Config) *Server {
 	featureProber := adt.NewFeatureProber(adtClient, featureConfig, cfg.Verbose)
 
 	// Create MCP server
-	mcpServer := server.NewMCPServer(
-		"mcp-abap-adt-go",
-		"1.0.0",
-		server.WithResourceCapabilities(true, true),
-		server.WithLogging(),
-	)
+	mcpServer := server.NewMCPServer("mcp-abap-adt-go", "1.0.0", mcpServerOptions()...)
 
 	s := &Server{
 		mcpServer:     mcpServer,
@@ -237,7 +336,36 @@ func parseFeatureMode(s string) adt.FeatureMode {
 
 // ServeStdio starts the MCP server on stdin/stdout.
 func (s *Server) ServeStdio() error {
-	return server.ServeStdio(s.mcpServer)
+	// A debuggee left attached when the server exits stays suspended in a work
+	// process until its caller times out, so the session is released here as
+	// well as on an explicit detach.
+	defer s.closeDebugSession(context.Background())
+
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
+	defer stop()
+	return s.serveStdio(ctx, os.Stdin, os.Stdout)
+}
+
+// serveStdio serves MCP over in/out until in closes or ctx ends. Both are how
+// a client shuts a stdio server down -- it closes stdin, and often signals the
+// process as well -- so both are a clean exit, not an error: an error here
+// reached the CLI, which printed it and the whole usage text to stderr on
+// every shutdown.
+func (s *Server) serveStdio(ctx context.Context, in io.Reader, out io.Writer) error {
+	err := server.NewStdioServer(s.mcpServer).Listen(ctx, in, out)
+	if stdioShutdown(err) {
+		return nil
+	}
+	return err
+}
+
+// stdioShutdown reports whether err only says the stdio session ended.
+func stdioShutdown(err error) bool {
+	return err == nil ||
+		errors.Is(err, context.Canceled) ||
+		errors.Is(err, io.EOF) ||
+		errors.Is(err, io.ErrClosedPipe) ||
+		errors.Is(err, os.ErrClosed)
 }
 
 // ServeHTTP starts the MCP server as a Streamable HTTP endpoint.
@@ -362,9 +490,10 @@ func newToolResultError(message string) *mcp.CallToolResult {
 // Returns error result if connection fails, nil on success.
 func (s *Server) ensureWSConnected(ctx context.Context, toolName string) *mcp.CallToolResult {
 	if s.amdpWSClient == nil || !s.amdpWSClient.IsConnected() {
-		s.amdpWSClient = adt.NewAMDPWebSocketClient(
-			s.config.BaseURL, s.config.Client, s.config.Username, s.config.Password, s.config.InsecureSkipVerify,
-		)
+		// Built from the ADT client, so the upgrade carries the session that
+		// client holds at this moment (including the last refresh an HTTP call
+		// made; building it does not re-authenticate), or its password without one.
+		s.amdpWSClient = s.adtClient.NewAMDPWebSocketClient()
 		if err := s.amdpWSClient.Connect(ctx); err != nil {
 			s.amdpWSClient = nil
 			return newToolResultError(fmt.Sprintf("%s: WebSocket connect failed: %v", toolName, err))
@@ -394,11 +523,12 @@ func (s *Server) requireActiveAMDPSession() *mcp.CallToolResult {
 // - handlers_ui5.go: UI5ListApps, UI5GetApp, etc.
 // - handlers_git.go: GitTypes, GitExport
 // - handlers_report.go: RunReport, GetVariants, etc.
-// - handlers_install.go: InstallZADTVSP, InstallAbapGit, etc.
+// - handlers_install.go: InstallZADTVSP, ListDependencies, DeployZip
 // - handlers_transport.go: ListTransports, GetTransport, etc.
 //
 // Tool registration is in:
-// - tools_register.go: registerTools() and all register*Tools() methods
+// - tools_register.go: registerTools() - mode logic and registration order
+// - tools_<domain>.go: the register*Tools() methods (tools_read.go, tools_crud.go, ...)
 // - tools_groups.go: toolGroups() - group definitions for --disabled-groups
 // - tools_focused.go: focusedToolSet() - focused mode whitelist
 // - tools_aliases.go: registerToolAliases() - short alias names

@@ -1,5 +1,5 @@
 // Package mcp provides the MCP server implementation for ABAP ADT tools.
-// handlers_install.go contains handlers for installing ZADT_VSP and abapGit.
+// handlers_install.go contains handlers for installing ZADT_VSP and deploying embedded ZIPs.
 package mcp
 
 import (
@@ -10,6 +10,7 @@ import (
 	"github.com/mark3labs/mcp-go/mcp"
 	embedded "github.com/oisee/vibing-steampunk/embedded/abap"
 	"github.com/oisee/vibing-steampunk/embedded/deps"
+	installer "github.com/oisee/vibing-steampunk/internal/install"
 	"github.com/oisee/vibing-steampunk/pkg/adt"
 )
 
@@ -22,10 +23,6 @@ func (s *Server) routeInstallAction(ctx context.Context, action, objectType, obj
 	switch installType {
 	case "install_zadt_vsp":
 		return s.callHandler(ctx, s.handleInstallZADTVSP, params)
-	case "install_abapgit":
-		return s.callHandler(ctx, s.handleInstallAbapGit, params)
-	case "install_dummy_test":
-		return s.callHandler(ctx, s.handleInstallDummyTest, params)
 	case "list_dependencies":
 		return s.callHandler(ctx, s.handleListDependencies, params)
 	case "deploy_zip":
@@ -35,272 +32,6 @@ func (s *Server) routeInstallAction(ctx context.Context, action, objectType, obj
 }
 
 // --- Install Handlers ---
-
-func (s *Server) handleInstallDummyTest(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	const (
-		testPackage   = "$ZADT_INSTALL_TEST"
-		testInterface = "ZIF_DUMMY_TEST"
-		testClass     = "ZCL_DUMMY_TEST"
-	)
-
-	checkOnly := false
-	if check, ok := request.GetArguments()["check_only"].(bool); ok {
-		checkOnly = check
-	}
-
-	cleanup := false
-	if cl, ok := request.GetArguments()["cleanup"].(bool); ok {
-		cleanup = cl
-	}
-
-	var sb strings.Builder
-	sb.WriteString("InstallDummyTest - Workflow Verification\n")
-	sb.WriteString("========================================\n\n")
-
-	// Track success/failure
-	allPassed := true
-	stepNum := 0
-
-	step := func(name string) {
-		stepNum++
-		fmt.Fprintf(&sb, "[Step %d] %s\n", stepNum, name)
-	}
-
-	pass := func(msg string) {
-		fmt.Fprintf(&sb, "  ✓ %s\n", msg)
-	}
-
-	fail := func(msg string) {
-		fmt.Fprintf(&sb, "  ✗ %s\n", msg)
-		allPassed = false
-	}
-
-	info := func(msg string) {
-		fmt.Fprintf(&sb, "  → %s\n", msg)
-	}
-
-	// Temporarily allow the install target package to bypass SAP_ALLOWED_PACKAGES restrictions.
-	cleanupPkgSafety := s.adtClient.AllowPackageTemporarily(testPackage)
-	defer cleanupPkgSafety()
-
-	// Step 1: Check/Create package (upsert strategy)
-	step("Package Check/Create")
-	pkg, err := s.adtClient.GetPackage(ctx, testPackage)
-	packageExists := err == nil && pkg.URI != "" // URI empty = package doesn't really exist
-	if !packageExists {
-		info("Package doesn't exist, creating...")
-		if checkOnly {
-			info("SKIP (check_only mode)")
-		} else {
-			err = s.adtClient.CreateObject(ctx, adt.CreateObjectOptions{
-				ObjectType:  adt.ObjectTypePackage,
-				Name:        testPackage,
-				Description: "Install Tools Test Package",
-			})
-			if err != nil {
-				fail(fmt.Sprintf("CreateObject(package) failed: %v", err))
-			} else {
-				// Verify
-				pkg, err = s.adtClient.GetPackage(ctx, testPackage)
-				if err != nil || pkg.URI == "" {
-					fail("Verification failed: package not found after create")
-				} else {
-					pass("Package created and verified")
-				}
-			}
-		}
-	} else {
-		pass("Package exists")
-	}
-
-	if checkOnly {
-		sb.WriteString("\n[check_only mode] Would deploy:\n")
-		// Check existing objects
-		intfResults, _ := s.adtClient.SearchObject(ctx, testInterface, 1)
-		intfExists := len(intfResults) > 0 && intfResults[0].Name == testInterface
-		classResults, _ := s.adtClient.SearchObject(ctx, testClass, 1)
-		classExists := len(classResults) > 0 && classResults[0].Name == testClass
-
-		intfAction := "CREATE"
-		if intfExists {
-			intfAction = "UPDATE"
-		}
-		classAction := "CREATE"
-		if classExists {
-			classAction = "UPDATE"
-		}
-		fmt.Fprintf(&sb, "  1. Interface: %s [%s]\n", testInterface, intfAction)
-		fmt.Fprintf(&sb, "  2. Class: %s [%s]\n", testClass, classAction)
-		return mcp.NewToolResultText(sb.String()), nil
-	}
-
-	// Step 2: Create/Update Interface (upsert)
-	step("Interface Creation")
-
-	// Check if interface exists
-	intfResults, _ := s.adtClient.SearchObject(ctx, testInterface, 1)
-	intfExists := len(intfResults) > 0 && intfResults[0].Name == testInterface
-	if intfExists {
-		info(fmt.Sprintf("Interface %s exists, will update", testInterface))
-	}
-
-	interfaceSource := `INTERFACE zif_dummy_test
-  PUBLIC.
-
-  METHODS get_value
-    RETURNING VALUE(rv_value) TYPE string.
-
-ENDINTERFACE.`
-
-	opts := &adt.WriteSourceOptions{
-		Package:     testPackage,
-		Description: "Dummy Test Interface",
-		Mode:        adt.WriteModeUpsert,
-	}
-	result, err := s.adtClient.WriteSource(ctx, "INTF", testInterface, interfaceSource, opts)
-	if err != nil {
-		fail(fmt.Sprintf("WriteSource failed: %v", err))
-	} else if !result.Success {
-		fail(fmt.Sprintf("WriteSource returned failure: %s", result.Message))
-	} else {
-		pass(fmt.Sprintf("Interface written (mode=%s)", result.Mode))
-	}
-
-	// Step 3: Verify Interface
-	step("Interface Verification")
-	results, err := s.adtClient.SearchObject(ctx, testInterface, 10)
-	if err != nil {
-		fail(fmt.Sprintf("SearchObject failed: %v", err))
-	} else {
-		found := false
-		for _, r := range results {
-			if r.Name == testInterface {
-				pass(fmt.Sprintf("Found: %s (%s) in %s", r.Name, r.Type, r.PackageName))
-				found = true
-				break
-			}
-		}
-		if !found {
-			fail("Interface not found in search results!")
-		}
-	}
-
-	// Step 4: Read Interface Source
-	step("Interface Source Read-back")
-	src, err := s.adtClient.GetSource(ctx, "INTF", testInterface, nil)
-	if err != nil {
-		fail(fmt.Sprintf("GetSource failed: %v", err))
-	} else {
-		pass(fmt.Sprintf("Source retrieved (%d bytes)", len(src)))
-	}
-
-	// Step 5: Create/Update Class (upsert)
-	step("Class Creation")
-
-	// Check if class exists
-	classResults, _ := s.adtClient.SearchObject(ctx, testClass, 1)
-	classExists := len(classResults) > 0 && classResults[0].Name == testClass
-	if classExists {
-		info(fmt.Sprintf("Class %s exists, will update", testClass))
-	}
-
-	classSource := `CLASS zcl_dummy_test DEFINITION
-  PUBLIC
-  FINAL
-  CREATE PUBLIC.
-
-  PUBLIC SECTION.
-    INTERFACES zif_dummy_test.
-
-ENDCLASS.
-
-CLASS zcl_dummy_test IMPLEMENTATION.
-
-  METHOD zif_dummy_test~get_value.
-    rv_value = 'Dummy Test Passed'.
-  ENDMETHOD.
-
-ENDCLASS.`
-
-	opts = &adt.WriteSourceOptions{
-		Package:     testPackage,
-		Description: "Dummy Test Class",
-		Mode:        adt.WriteModeUpsert,
-	}
-	result, err = s.adtClient.WriteSource(ctx, "CLAS", testClass, classSource, opts)
-	if err != nil {
-		fail(fmt.Sprintf("WriteSource failed: %v", err))
-	} else if !result.Success {
-		fail(fmt.Sprintf("WriteSource returned failure: %s", result.Message))
-	} else {
-		pass(fmt.Sprintf("Class written (mode=%s)", result.Mode))
-	}
-
-	// Step 6: Verify Class
-	step("Class Verification")
-	results, err = s.adtClient.SearchObject(ctx, testClass, 10)
-	if err != nil {
-		fail(fmt.Sprintf("SearchObject failed: %v", err))
-	} else {
-		found := false
-		for _, r := range results {
-			if r.Name == testClass {
-				pass(fmt.Sprintf("Found: %s (%s) in %s", r.Name, r.Type, r.PackageName))
-				found = true
-				break
-			}
-		}
-		if !found {
-			fail("Class not found in search results!")
-		}
-	}
-
-	// Step 7: Read Class Source
-	step("Class Source Read-back")
-	src, err = s.adtClient.GetSource(ctx, "CLAS", testClass, nil)
-	if err != nil {
-		fail(fmt.Sprintf("GetSource failed: %v", err))
-	} else {
-		pass(fmt.Sprintf("Source retrieved (%d bytes)", len(src)))
-	}
-
-	// Step 8: Run Unit Tests (optional verification)
-	step("Unit Tests (Activation Check)")
-	testResult, err := s.adtClient.RunUnitTests(ctx, fmt.Sprintf("/sap/bc/adt/oo/classes/%s", strings.ToLower(testClass)), nil)
-	if err != nil {
-		info(fmt.Sprintf("RunUnitTests: %v (expected - no tests defined)", err))
-	} else {
-		pass(fmt.Sprintf("Unit test framework responded (classes=%d)", len(testResult.Classes)))
-	}
-
-	// Cleanup if requested
-	if cleanup {
-		sb.WriteString("\n[Cleanup]\n")
-		sb.WriteString("  → Cleanup not yet implemented (manual deletion required)\n")
-		// TODO: Implement delete via ADT
-	}
-
-	// Summary
-	sb.WriteString("\n========================================\n")
-	if allPassed {
-		sb.WriteString("✅ ALL TESTS PASSED\n")
-		sb.WriteString("\nThe Install* workflow is working correctly:\n")
-		sb.WriteString("  • Package creation ✓\n")
-		sb.WriteString("  • Interface creation (WriteSource) ✓\n")
-		sb.WriteString("  • Interface verification (SearchObject) ✓\n")
-		sb.WriteString("  • Interface read-back (GetSource) ✓\n")
-		sb.WriteString("  • Class creation (WriteSource) ✓\n")
-		sb.WriteString("  • Class verification (SearchObject) ✓\n")
-		sb.WriteString("  • Class read-back (GetSource) ✓\n")
-	} else {
-		sb.WriteString("❌ SOME TESTS FAILED\n")
-		sb.WriteString("\nCheck the steps above for details.\n")
-	}
-
-	fmt.Fprintf(&sb, "\nTest objects in package: %s\n", testPackage)
-
-	return mcp.NewToolResultText(sb.String()), nil
-}
 
 func (s *Server) handleInstallZADTVSP(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	// Parse parameters
@@ -331,11 +62,11 @@ func (s *Server) handleInstallZADTVSP(ctx context.Context, request mcp.CallToolR
 	// Phase 1: Check prerequisites
 	sb.WriteString("Checking prerequisites...\n")
 
-	// Check if package exists (verify URI is populated - empty URI means package doesn't really exist)
-	packageExists := false
-	pkg, err := s.adtClient.GetPackage(ctx, packageName)
-	if err == nil && pkg.URI != "" {
-		packageExists = true
+	packageExists, err := s.adtClient.PackageExists(ctx, packageName)
+	if err != nil {
+		return newToolResultError(fmt.Sprintf("Failed to check package %s: %v", packageName, err)), nil
+	}
+	if packageExists {
 		fmt.Fprintf(&sb, "  ✓ Package %s exists\n", packageName)
 	} else {
 		fmt.Fprintf(&sb, "  → Package %s will be created\n", packageName)
@@ -372,7 +103,7 @@ func (s *Server) handleInstallZADTVSP(ctx context.Context, request mcp.CallToolR
 		sb.WriteString("Check complete (--check_only mode, no changes made).\n\n")
 		sb.WriteString("Objects to deploy:\n")
 		for i, obj := range objects {
-			if obj.Optional && skipGitService && obj.Name == "ZCL_VSP_GIT_SERVICE" {
+			if obj.RequiresAbapGit && skipGitService {
 				fmt.Fprintf(&sb, "  [%d/%d] %s - SKIP (no abapGit)\n", i+1, len(objects), obj.Name)
 			} else {
 				fmt.Fprintf(&sb, "  [%d/%d] %s - %s\n", i+1, len(objects), obj.Name, obj.Description)
@@ -387,23 +118,12 @@ func (s *Server) handleInstallZADTVSP(ctx context.Context, request mcp.CallToolR
 	defer cleanupPkgSafety()
 
 	// Phase 2: Create package if needed
-	if !packageExists {
-		fmt.Fprintf(&sb, "Creating package %s...\n", packageName)
-		createOpts := adt.CreateObjectOptions{
-			ObjectType:  adt.ObjectTypePackage,
-			Name:        packageName,
-			Description: "VSP WebSocket Handler",
-		}
-		err := s.adtClient.CreateObject(ctx, createOpts)
-		if err != nil {
-			// On older SAP releases (e.g. 7.40), /sap/bc/adt/packages may not exist.
-			// Don't abort — the package may have been pre-created via SE21/SE80,
-			// and WriteSource will fail with a clear error if it truly doesn't exist.
-			fmt.Fprintf(&sb, "  ⚠ Package creation failed: %v\n", err)
-			fmt.Fprintf(&sb, "  → Continuing anyway (package may already exist via SE21/SE80)\n\n")
-		} else {
-			fmt.Fprintf(&sb, "  ✓ Package %s created\n\n", packageName)
-		}
+	created, err := installer.EnsurePackage(ctx, s.adtClient, packageName, "VSP WebSocket Handler")
+	if err != nil {
+		return newToolResultError(fmt.Sprintf("Failed to ensure package %s: %v", packageName, err)), nil
+	}
+	if created {
+		fmt.Fprintf(&sb, "Package %s created and verified\n\n", packageName)
 	} else {
 		fmt.Fprintf(&sb, "Using existing package %s\n\n", packageName)
 	}
@@ -416,8 +136,8 @@ func (s *Server) handleInstallZADTVSP(ctx context.Context, request mcp.CallToolR
 	failed := []string{}
 
 	for i, obj := range objects {
-		// Skip Git service if no abapGit
-		if obj.Name == "ZCL_VSP_GIT_SERVICE" && skipGitService {
+		// Skip the git service and its job program if no abapGit
+		if obj.RequiresAbapGit && skipGitService {
 			fmt.Fprintf(&sb, "  [%d/%d] %s ⊘ Skipped (no abapGit)\n", i+1, len(objects), obj.Name)
 			skipped = append(skipped, obj.Name)
 			continue
@@ -427,16 +147,37 @@ func (s *Server) handleInstallZADTVSP(ctx context.Context, request mcp.CallToolR
 
 		// Use WriteSource to create/update
 		opts := &adt.WriteSourceOptions{
-			Package: packageName,
-			Mode:    adt.WriteModeUpsert,
+			Package:     packageName,
+			Description: obj.Description,
+			Mode:        adt.WriteModeUpsert,
 		}
-		_, err := s.adtClient.WriteSource(ctx, obj.Type, obj.Name, obj.Source, opts)
+		_, err := installer.DeploySource(ctx, s.adtClient, obj.Type, obj.Name, obj.Source, opts)
 		if err != nil {
 			fmt.Fprintf(&sb, "✗ Failed: %v\n", err)
 			failed = append(failed, obj.Name+": "+err.Error())
 		} else {
 			sb.WriteString("✓ Deployed\n")
 			deployed = append(deployed, obj.Name)
+		}
+	}
+
+	// The transport service's push channel. Without it uploads still work;
+	// their outcome is read with transport_status.
+	fmt.Fprintf(&sb, "  AMC %s (transport push) ", embedded.AMCApplicationName)
+	if err := s.adtClient.UpsertAMCApplication(ctx, embedded.AMCApplicationName, embedded.AMCApplicationDescription,
+		packageName, embedded.AMCApplicationDefinition); err != nil {
+		fmt.Fprintf(&sb, "– not set up (%v); upload outcomes are read with transport_status\n", err)
+	} else {
+		sb.WriteString("✓ Deployed\n")
+	}
+	// The git import's push channel, only with the git service it names.
+	if !skipGitService {
+		fmt.Fprintf(&sb, "  AMC %s (git import push) ", embedded.AMCGitApplicationName)
+		if err := s.adtClient.UpsertAMCApplication(ctx, embedded.AMCGitApplicationName, embedded.AMCGitApplicationDescription,
+			packageName, embedded.AMCGitApplicationDefinition); err != nil {
+			fmt.Fprintf(&sb, "– not set up (%v); import outcomes are read with git_import_status\n", err)
+		} else {
+			sb.WriteString("✓ Deployed\n")
 		}
 	}
 
@@ -457,6 +198,9 @@ func (s *Server) handleInstallZADTVSP(ctx context.Context, request mcp.CallToolR
 	}
 
 	fmt.Fprintf(&sb, "\nDeployed: %d, Skipped: %d, Failed: %d\n\n", len(deployed), len(skipped), len(failed))
+	if len(failed) > 0 {
+		return newToolResultError(sb.String()), nil
+	}
 
 	// Post-deployment instructions
 	sb.WriteString(embedded.PostDeploymentInstructions())
@@ -467,9 +211,9 @@ func (s *Server) handleInstallZADTVSP(ctx context.Context, request mcp.CallToolR
 	sb.WriteString("  ✓ RFC/BAPI execution\n")
 	sb.WriteString("  ✓ AMDP debugging (experimental)\n")
 	if hasAbapGit && !skipGitService {
-		sb.WriteString("  ✓ abapGit export (158 object types)\n")
+		sb.WriteString("  ✓ abapGit export and zip import (git_import_zip)\n")
 	} else {
-		sb.WriteString("  ✗ abapGit export (install abapGit first)\n")
+		sb.WriteString("  ✗ abapGit export and import (install abapGit first)\n")
 	}
 
 	return mcp.NewToolResultText(sb.String()), nil
@@ -494,115 +238,10 @@ func (s *Server) handleListDependencies(ctx context.Context, request mcp.CallToo
 	}
 
 	sb.WriteString("Usage:\n")
-	sb.WriteString("  InstallAbapGit --edition standalone  # Single program ZABAPGIT\n")
-	sb.WriteString("  InstallAbapGit --edition dev         # Full $ZGIT_DEV packages\n")
-	sb.WriteString("\nNote: To add dependency ZIPs, export from SAP with GitExport and\n")
-	sb.WriteString("embed in embedded/deps/\n")
-
-	return mcp.NewToolResultText(sb.String()), nil
-}
-
-func (s *Server) handleInstallAbapGit(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	// Parse parameters
-	edition := "standalone"
-	if ed, ok := request.GetArguments()["edition"].(string); ok && ed != "" {
-		edition = strings.ToLower(ed)
-	}
-
-	packageName := ""
-	if pkg, ok := request.GetArguments()["package"].(string); ok && pkg != "" {
-		packageName = strings.ToUpper(pkg)
-	}
-
-	checkOnly := false
-	if check, ok := request.GetArguments()["check_only"].(bool); ok {
-		checkOnly = check
-	}
-
-	// Validate edition
-	if edition != "standalone" && edition != "dev" {
-		return newToolResultError("Invalid edition. Use 'standalone' or 'dev'"), nil
-	}
-
-	// Set default package based on edition
-	if packageName == "" {
-		if edition == "standalone" {
-			packageName = "$ABAPGIT"
-		} else {
-			packageName = "$ZGIT_DEV"
-		}
-	}
-
-	// Validate package name
-	if !strings.HasPrefix(packageName, "$") {
-		return newToolResultError("Package name must start with $ (local package)"), nil
-	}
-
-	var sb strings.Builder
-	fmt.Fprintf(&sb, "Install abapGit (%s edition)\n", edition)
-	sb.WriteString("============================\n\n")
-
-	// Check if ZIP is available
-	dependencies := deps.GetAvailableDependencies()
-	var selectedDep *deps.DependencyInfo
-	for i, dep := range dependencies {
-		if (edition == "standalone" && dep.Name == "abapgit-standalone") ||
-			(edition == "dev" && dep.Name == "abapgit-dev") {
-			selectedDep = &dependencies[i]
-			break
-		}
-	}
-
-	if selectedDep == nil {
-		return newToolResultError(fmt.Sprintf("Edition '%s' not found in available dependencies", edition)), nil
-	}
-
-	if !selectedDep.Available {
-		sb.WriteString("⚠ ZIP not embedded yet\n\n")
-		sb.WriteString("To embed abapGit:\n")
-		sb.WriteString("1. On a system with abapGit installed, run:\n")
-		if edition == "standalone" {
-			sb.WriteString("   vsp git-export --objects '[{\"type\":\"PROG\",\"name\":\"ZABAPGIT\"}]' > abapgit-standalone.zip\n")
-		} else {
-			sb.WriteString("   vsp git-export --packages '$ZGIT_DEV' --include-subpackages > abapgit-dev.zip\n")
-		}
-		sb.WriteString("\n2. Place ZIP in embedded/deps/\n")
-		sb.WriteString("3. Update embedded/deps/embed.go with go:embed directive\n")
-		sb.WriteString("4. Rebuild vsp\n\n")
-		sb.WriteString("Alternative: Download from GitHub:\n")
-		sb.WriteString("  https://github.com/abapGit/abapGit\n")
-		return mcp.NewToolResultText(sb.String()), nil
-	}
-
-	// Temporarily allow the install target package to bypass SAP_ALLOWED_PACKAGES restrictions.
-	cleanupPkg := s.adtClient.AllowPackageTemporarily(packageName)
-	defer cleanupPkg()
-
-	// TODO: Implement actual deployment when ZIPs are embedded
-	// This is the workflow:
-	// 1. Get ZIP data from embedded variable
-	// 2. files, err := deps.UnzipInMemory(zipData)
-	// 3. plan := deps.CreateDeploymentPlan(edition, packageName, files)
-	// 4. If checkOnly, show plan and return
-	// 5. For each object in plan:
-	//    - Check if exists (SearchObject)
-	//    - WriteSource for main source
-	//    - WriteSource for each include (locals_def, locals_imp, testclasses)
-	// 6. Show summary
-
-	fmt.Fprintf(&sb, "Target package: %s\n", packageName)
-	fmt.Fprintf(&sb, "Edition: %s\n", edition)
-	fmt.Fprintf(&sb, "Check only: %v\n\n", checkOnly)
-
-	sb.WriteString("Status: ZIP embedding ready, deployment logic implemented.\n")
-	sb.WriteString("Waiting for actual ZIP files to be embedded.\n\n")
-
-	sb.WriteString("Architecture:\n")
-	sb.WriteString("  1. embedded/deps/embed.go - go:embed for ZIP files\n")
-	sb.WriteString("  2. deps.UnzipInMemory() - Extract files in memory\n")
-	sb.WriteString("  3. deps.ParseAbapGitFilename() - Parse object type/name\n")
-	sb.WriteString("  4. deps.CreateDeploymentPlan() - Sort by dependency order\n")
-	sb.WriteString("  5. WriteSource() - Deploy each object via ADT\n")
+	sb.WriteString("  vsp install abapgit --edition standalone  # CLI: single program ZABAPGIT\n")
+	sb.WriteString("  DeployZip source=abapgit-standalone package=$ABAPGIT\n")
+	sb.WriteString("\nabapGit install is CLI-only (standalone edition) for now; the MCP install\n")
+	sb.WriteString("tool is being rebuilt (#277). The developer edition is not installable yet.\n")
 
 	return mcp.NewToolResultText(sb.String()), nil
 }

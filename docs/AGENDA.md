@@ -59,6 +59,34 @@ checkout passes `go test ./...`; activation failures surface as failures.
       closing reference to `#2` from `#106` first.
 - [ ] **(maintainer)** Close with an explanation: `#151`, `#138`, `#130`, `#139`.
 
+**Fixed here instead of merging** (2026-08-21). Each of these was reported by a
+contributor and is now fixed on `main`; the PRs shrink or close, and the credit
+belongs to whoever found it:
+
+- [x] **The deploy path checked syntax while holding the lock.** A syntax check
+      is a stateless request, and one sent while a lock is held ends the session
+      the lock lives in, so the write came back `423 InvalidLockHandle`. Both
+      deploy branches now check before locking, as `EditSource` always did. This
+      is the cause behind much of the `#88`/`#91`/`#92`/`#98`/`#110` family, and
+      the concern `#108` raised first.
+- [x] **A 403 on the CSRF `HEAD` skipped the `GET` fallback** — the exact case
+      `#104` reports. Only a 401 short-circuits now.
+- [x] **A read-only system was writable from the command line.** Only the MCP
+      server ever handed a safety configuration to its ADT client, so
+      `read_only` and `allowed_packages` in `.vsp.json` restricted nothing on any
+      CLI subcommand. Raised as one of the concerns in `#156`.
+- [x] **An empty embedded archive deployed nothing and reported success.** Both
+      abapGit ZIPs in this repository are zero bytes; two of the three call
+      sites checked only for `nil`. Related to `#138`.
+
+**Still to do ourselves rather than merge:**
+
+- [ ] The remaining concerns of `#156` that survive review, taken one at a time
+      rather than as one eleven-part change.
+- [ ] Ship the abapGit archives, or stop advertising them. `vsp rfc export
+      '$ABAPGIT'` produces one in a single command now, which makes a build-time
+      fetch a real option.
+
 **Done when:** the Tier 0 list is empty, message classes round-trip, and the open-PR
 count is in single digits.
 
@@ -124,8 +152,11 @@ a BTP system with OAuth2, both configured from `.vsp.json`.
 - [x] `ZADT_DEBUG_*` facade — parameterised attach / step / stack / variables, modelled
       on the test harness that already works over RFC (extends the existing ZADT_DEBUG
       group; no underscore straight after `Z`, per this landscape's convention).
-- [ ] `vsp-debugd` — a daemon owning a pinned `rfc.Session`, with the short-lived
-      MCP/CLI calls talking to it; revives the disabled debugger tools.
+- [~] `vsp-debugd` — a daemon owning a pinned `rfc.Session`. The MCP half of its
+      purpose is served: the MCP server holds the session itself, which is
+      simpler than a daemon and needs no IPC. A daemon is still what would let
+      *separate CLI invocations* share one debug session; that is now a
+      convenience rather than the thing blocking the tools.
 - [x] abapGit over RFC — `vsp rfc export <PACKAGE>` serializes a package to an
       abapGit ZIP with one call to abapGit's own `Z_ABAPGIT_SERIALIZE_PACKAGE`,
       replacing the `vsp export` → APC WebSocket → `ZCL_VSP_GIT_SERVICE` →
@@ -153,6 +184,71 @@ a BTP system with OAuth2, both configured from `.vsp.json`.
 
 **Done when:** a breakpoint can be set, hit and inspected from an MCP client without
 ZADT_VSP, and `vsp` works against a system with HTTP disabled.
+
+### Sprint 5 — Execution truth: the debugger, and what really ran
+
+Design: [`docs/design/execution-trace.md`](design/execution-trace.md). The
+resources this needs are all present on A4H and all reachable through the RFC
+tunnel; the evidence is in that note.
+
+- [x] **Make the README's "AI Debugger" line true.** Done 2026-08-21.
+      Variables are implemented and typed (`Locals` walks @ROOT -> @LOCALS so a
+      caller need not know the id scheme); breakpoints turned out to need no Z
+      code either — `POST /sap/bc/adt/debugger/breakpoints` answers 200 on both
+      transports, and pkg/adt's "403 on newer SAP" was the stateless client, not
+      the release. The MCP tools are off `DefaultDisabledTools` and run on a
+      session the server holds itself (`internal/mcp/handlers_debug_session.go`),
+      so no `vsp-debugd` is needed for them. Driven live end to end: breakpoint,
+      catch, locals, step 9 -> 14 with LV_LOW becoming 27, detach.
+      Three bugs the cross-transport testing found, all fixed: a session deleted
+      the breakpoints it had just set (detach ends external debugging for the
+      user); the HTTPS route left its debuggee suspended until the caller timed
+      out; and `vsp adt debug` could not outlast its own listener.
+      An integration test now runs one script over both transports and requires
+      them to agree (`-run Conformance ./pkg/saprfc/`).
+- [ ] **AMDP debugging — a spike.** `/sap/bc/adt/amdp/debugger/main` and
+      `…/debuggees/{id}/variables/{var}` are in the discovery document, with
+      `/sap/bc/adt/datapreview/amdpdebugger` for table cells. Answer three
+      questions and stop: does it tunnel, what HANA privileges does it want, and
+      does it need a live AMDP call to attach to.
+- [x] **The measured call tree.** Done 2026-08-21. `vsp trace run|list|tree|
+      requests|rm` over `/sap/bc/adt/runtime/traces/abaptraces`, on either
+      transport (`pkg/saprfc/trace.go`); `--json` emits the per-statement
+      stream. Two facts that are not in any documentation: a request without a
+      `parametersId` is forced to full aggregation, so a *tree* always costs a
+      POST to `/parameters` first, and the query parameters are camelCase —
+      lowercase ones are accepted and ignored. Aim a request at a named object:
+      "any object, any process type, this user" traces vsp's own session, which
+      is what the first attempt recorded.
+- [ ] **Real graph vs extracted graph.** Diff the measured tree against vsp's
+      static graph and classify every edge: static-only (never exercised),
+      trace-only (**a dynamic call** — `CALL FUNCTION lv_name`, `PERFORM (f)`,
+      `SUBMIT (rep)`, an RFC destination), or both. This is the first genuinely
+      new insight and needs no debugger.
+- [ ] **Argument capture at code-unit boundaries**, via
+      `IF_TPDAPI_SESSION~GET_SCRIPT_HANDLER` — SAP's debugger scripting runs
+      inside the debuggee, so recording costs no round trip per step. Output is
+      the one JSONL record format from the design note. Values redacted by
+      default.
+- [ ] **Full statement-level history and replay.** Same format, more of it, with
+      a mandatory bound. Then replay: an ABAP unit test generated from a
+      recorded call, its captured inputs asserted against its captured outputs.
+- [ ] **`vsp trace study`** — the offline tool, in the shape of `rfc-viewer`:
+      reads the JSONL and never touches a system, shows the observed graph, the
+      diff, a per-unit argument view, and `--html` / `--serve`.
+
+### Backlog — a logon-ticket reader
+
+- [ ] **Parse and validate an SAP logon ticket** (`MYSAPSSO2` / assertion), from
+      the format decoded live on 2026-08-21 (open-rfc-go
+      `docs/discoveries/http-destination-logon-modes.md`): cookie-normalise
+      (`!`->`/`, URL-unescape), base64-decode, walk the TLV, expose user /
+      client / issuing system / creation time / recipient (assertion) /
+      signature presence. Reading one lets every HTTP path (ADT, the SOAP RFC
+      endpoint) fail with a clear "this ticket is for user X on system Y, issued
+      Z, expired" instead of a bare rejection, and pick the right route knowing
+      the target. Small and self-contained. Does **not** unlock ticket-based
+      classic-RFC logon — that CPIC field is still unobserved.
 
 ### Later (not scheduled)
 

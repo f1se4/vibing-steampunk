@@ -156,6 +156,27 @@ func TestCreateObject_CleanFailureBeforePersistence(t *testing.T) {
 	}
 }
 
+func TestReconcileFailedCreateDoesNotDeletePreExistingObject(t *testing.T) {
+	mock := &methodPathMock{}
+	client := newReconcileClient(t, mock)
+	createErr := &APIError{
+		StatusCode: http.StatusBadRequest,
+		Message:    "ExceptionResourceAlreadyExists: synthetic object already exists",
+	}
+
+	err := client.reconcileFailedCreate(context.Background(), CreateObjectOptions{
+		ObjectType:  ObjectTypePackage,
+		Name:        "$SYNTHETIC",
+		PackageName: "$SYNTHETIC",
+	}, createErr)
+	if !errors.Is(err, createErr) {
+		t.Fatalf("error = %v, want original already-exists error", err)
+	}
+	if len(mock.calls) != 0 {
+		t.Fatalf("reconciliation touched a pre-existing object: %#v", mock.calls)
+	}
+}
+
 // TestCreateObject_PartialPersistenceCleanupOK covers the prod-incident
 // scenario: CreateObject POST returns 500 but SAP already persisted the
 // object. The existence probe returns 200, lock acquisition succeeds,
@@ -218,6 +239,9 @@ func TestCreateObject_PartialPersistenceLockFails(t *testing.T) {
 		routes: []routedResponse{
 			resp("", "discovery", 200, "ok"),
 			resp(http.MethodPost, "nodestructure", 200, packageNodeStructureXML),
+			// The delete gate resolves the package before the cleanup locks
+			// anything (issue #238), so it must pass for the lock to be reached.
+			resp("", "informationsystem/search", 200, searchZTESTInTmpXML),
 			// Specific path (with name) before broad. Lock POST →
 			// 403 to simulate "locked by another user".
 			resp(http.MethodGet, "/programs/programs/ZTEST", 200, "<p/>"),
@@ -322,14 +346,15 @@ func TestDeleteObject_UsesStatefulSession(t *testing.T) {
 // stateful-session regression test — the main methodPathMock already
 // records method+path but throws headers away.
 type headerCaptureMock struct {
-	inner     *methodPathMock
-	captured  []capturedReq
+	inner    *methodPathMock
+	captured []capturedReq
 }
 
 type capturedReq struct {
 	method      string
 	path        string
 	sessionType string
+	cookie      string
 }
 
 func (h *headerCaptureMock) Do(req *http.Request) (*http.Response, error) {
@@ -337,6 +362,7 @@ func (h *headerCaptureMock) Do(req *http.Request) (*http.Response, error) {
 		method:      req.Method,
 		path:        req.URL.Path,
 		sessionType: req.Header.Get("X-sap-adt-sessiontype"),
+		cookie:      req.Header.Get("Cookie"),
 	})
 	return h.inner.Do(req)
 }
@@ -419,6 +445,9 @@ func TestRecoverFailedCreate_LockHeldByAnother(t *testing.T) {
 	mock := &methodPathMock{
 		routes: []routedResponse{
 			resp("", "discovery", 200, "ok"),
+			// Without the package lookup the recovery stops at the mutation
+			// gate and never reaches the lock this test is about.
+			resp("", "informationsystem/search", 200, searchZTESTInTmpXML),
 			resp(http.MethodGet, "/programs/programs/ZTEST", 200, "<p/>"),
 			resp(http.MethodPost, "/programs/programs/ZTEST", 403, "locked by another user"),
 		},
@@ -432,6 +461,15 @@ func TestRecoverFailedCreate_LockHeldByAnother(t *testing.T) {
 	})
 	if pce == nil {
 		t.Fatal("expected PartialCreateError, got nil")
+	}
+	locked := false
+	for _, c := range mock.calls {
+		if c.method == http.MethodPost && strings.Contains(c.path, "/programs/programs/ZTEST") {
+			locked = true
+		}
+	}
+	if !locked {
+		t.Fatalf("recovery never tried to lock the object; calls: %#v", mock.calls)
 	}
 	if pce.CleanupOK {
 		t.Error("CleanupOK = true, want false — lock acquisition failed")
@@ -550,14 +588,17 @@ func TestCreateTestInclude_UsesStatefulSession(t *testing.T) {
 	}
 }
 
-// TestLockObject_RejectsNoModification covers the BTP / ABAP Cloud
-// case from issue #91: a successful LOCK can return
-// MODIFICATION_SUPPORT=NoModification to signal that the object is
-// read-only via ADT for this user/system. Before the fix the caller
-// proceeded to PUT and got a confusing 423 InvalidLockHandle several
-// seconds later. The expected behaviour is to fail at the LOCK call
-// with a clear, actionable error message.
-func TestLockObject_RejectsNoModification(t *testing.T) {
+// TestLockObject_AllowsNoModificationWithHandle pins the corrected reading of
+// MODIFICATION_SUPPORT. The original issue #91 guard failed the LOCK whenever
+// SAP said "NoModification", but that field does not mean "you cannot write":
+// it is what SAP returns for local/customer objects that need no modification
+// recording. Verified against A4H — LOCK on a local global class returns
+// IS_LOCAL=X, MODIFICATION_SUPPORT=NoModification and a valid LOCK_HANDLE, and
+// the PUT of .../source/main that follows returns 200. Worse, the guard
+// returned before unlocking, so every blocked attempt leaked the ENQUEUE it had
+// just taken and the object became genuinely unusable behind our own orphan
+// lock.
+func TestLockObject_AllowsNoModificationWithHandle(t *testing.T) {
 	const noModLockXML = `<?xml version="1.0" encoding="UTF-8"?>
 <asx:abap xmlns:asx="http://www.sap.com/abapxml" version="1.0">
   <asx:values>
@@ -566,7 +607,7 @@ func TestLockObject_RejectsNoModification(t *testing.T) {
       <CORRNR></CORRNR>
       <CORRUSER></CORRUSER>
       <CORRTEXT></CORRTEXT>
-      <IS_LOCAL></IS_LOCAL>
+      <IS_LOCAL>X</IS_LOCAL>
       <IS_LINK_UP></IS_LINK_UP>
       <MODIFICATION_SUPPORT>NoModification</MODIFICATION_SUPPORT>
     </DATA>
@@ -575,7 +616,47 @@ func TestLockObject_RejectsNoModification(t *testing.T) {
 	mock := &methodPathMock{
 		routes: []routedResponse{
 			resp("", "discovery", 200, "ok"),
-			resp(http.MethodPost, "/oo/classes/ZREADONLY", 200, noModLockXML),
+			resp(http.MethodPost, "/oo/classes/ZLOCAL", 200, noModLockXML),
+		},
+	}
+	cfg := NewConfig("https://sap.example.com:44300", "user", "pass")
+	transport := NewTransportWithClient(cfg, mock)
+	client := NewClientWithTransport(cfg, transport)
+
+	lock, err := client.LockObject(
+		context.Background(),
+		"/sap/bc/adt/oo/classes/ZLOCAL",
+		"MODIFY",
+	)
+	if err != nil {
+		t.Fatalf("LockObject returned error for a usable lock handle: %v", err)
+	}
+	if lock.LockHandle != "HANDLE-X" {
+		t.Errorf("LockHandle = %q, want \"HANDLE-X\"", lock.LockHandle)
+	}
+	if lock.ModificationSupport != "NoModification" {
+		t.Errorf("ModificationSupport = %q, want it preserved for the caller", lock.ModificationSupport)
+	}
+}
+
+// TestLockObject_RejectsLockWithoutHandle keeps the genuinely unusable case
+// from issue #91 covered: a LOCK that comes back without a handle leaves
+// nothing to write with, so it must fail at the LOCK call with an actionable
+// message rather than at a confusing 423 InvalidLockHandle seconds later.
+func TestLockObject_RejectsLockWithoutHandle(t *testing.T) {
+	const noHandleLockXML = `<?xml version="1.0" encoding="UTF-8"?>
+<asx:abap xmlns:asx="http://www.sap.com/abapxml" version="1.0">
+  <asx:values>
+    <DATA>
+      <LOCK_HANDLE></LOCK_HANDLE>
+      <MODIFICATION_SUPPORT>NoModification</MODIFICATION_SUPPORT>
+    </DATA>
+  </asx:values>
+</asx:abap>`
+	mock := &methodPathMock{
+		routes: []routedResponse{
+			resp("", "discovery", 200, "ok"),
+			resp(http.MethodPost, "/oo/classes/ZREADONLY", 200, noHandleLockXML),
 		},
 	}
 	cfg := NewConfig("https://sap.example.com:44300", "user", "pass")
@@ -588,13 +669,46 @@ func TestLockObject_RejectsNoModification(t *testing.T) {
 		"MODIFY",
 	)
 	if err == nil {
-		t.Fatal("LockObject should have returned an error for NoModification, got nil")
+		t.Fatal("LockObject should have returned an error for a LOCK without a handle, got nil")
 	}
 	if !strings.Contains(err.Error(), "not modifiable") {
 		t.Errorf("error = %q, want to contain \"not modifiable\"", err.Error())
 	}
 	if !strings.Contains(err.Error(), "NoModification") {
 		t.Errorf("error = %q, want to surface the raw modificationSupport value", err.Error())
+	}
+}
+
+// TestLockObject_SurfacesEnqueueConflict covers the EU510 case: another
+// session (often a dead one of our own) still holds the ENQUEUE, and ADT
+// answers _action=LOCK with an exception document. Parsed as a lock result
+// that used to degrade into an empty LockResult and a misleading
+// "NoModification" report; the real message must reach the caller.
+func TestLockObject_SurfacesEnqueueConflict(t *testing.T) {
+	const conflictXML = `<?xml version="1.0" encoding="utf-8"?><exc:exception xmlns:exc="http://www.sap.com/abapxml/types/communicationframework"><namespace id="com.sap.adt"/><type id="ExceptionResourceNoAccess"/><message lang="EN">User TESTUSER is currently editing ZCL_DEMO_LOCKED</message></exc:exception>`
+	mock := &methodPathMock{
+		routes: []routedResponse{
+			resp("", "discovery", 200, "ok"),
+			resp(http.MethodPost, "/oo/classes/ZCL_DEMO_LOCKED", 200, conflictXML),
+		},
+	}
+	cfg := NewConfig("https://sap.example.com:44300", "user", "pass")
+	transport := NewTransportWithClient(cfg, mock)
+	client := NewClientWithTransport(cfg, transport)
+
+	_, err := client.LockObject(
+		context.Background(),
+		"/sap/bc/adt/oo/classes/ZCL_DEMO_LOCKED",
+		"MODIFY",
+	)
+	if err == nil {
+		t.Fatal("LockObject should have returned an error for an ADT exception, got nil")
+	}
+	if !strings.Contains(err.Error(), "currently editing") {
+		t.Errorf("error = %q, want SAP's own EU510 message", err.Error())
+	}
+	if !strings.Contains(err.Error(), "ExceptionResourceNoAccess") {
+		t.Errorf("error = %q, want the ADT exception type", err.Error())
 	}
 }
 
@@ -637,5 +751,76 @@ func TestLockObject_AllowsNoModificationOnReadLock(t *testing.T) {
 	}
 	if result.LockHandle != "HANDLE-X" {
 		t.Errorf("LockHandle = %q, want HANDLE-X", result.LockHandle)
+	}
+}
+
+// TestDeleteObject_ReleasesProxyContext pins the tail of a delete chain
+// behind a session-holding proxy: a DELETE consumes the lock handle but never
+// sends an UNLOCK, so the ENQUEUE stays with the stateful context until the
+// proxy times the session out. With the guard on, DeleteObject must retire the
+// context after the DELETE the same way UnlockObject does — a stateless HEAD
+// on discovery without a Cookie, so the proxy injects the context to end.
+func TestDeleteObject_ReleasesProxyContext(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		guard       bool
+		wantRelease bool
+	}{
+		{name: "guard on retires the context", guard: true, wantRelease: true},
+		{name: "guard off sends nothing extra", guard: false, wantRelease: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			mock := &methodPathMock{
+				routes: []routedResponse{
+					resp("", "discovery", 200, "ok"),
+					resp("", "informationsystem/search", 200, searchZTESTInTmpXML),
+					resp(http.MethodDelete, "/programs/programs/ZTEST", 200, ""),
+				},
+			}
+			tracker := &headerCaptureMock{inner: mock}
+			opts := []Option{WithAllowedPackages("$TMP")}
+			if tc.guard {
+				opts = append(opts, WithProxyContextIDGuard())
+			}
+			cfg := NewConfig("https://sap.example.com:44300", "user", "pass", opts...)
+			client := NewClientWithTransport(cfg, NewTransportWithClient(cfg, tracker))
+
+			err := client.DeleteObject(context.Background(), "/sap/bc/adt/programs/programs/ZTEST", "TESTHANDLE", "")
+			if err != nil {
+				t.Fatalf("DeleteObject failed: %v", err)
+			}
+
+			deleteAt := -1
+			for i, c := range tracker.captured {
+				if c.method == http.MethodDelete {
+					deleteAt = i
+				}
+			}
+			if deleteAt < 0 {
+				t.Fatal("no DELETE request was sent")
+			}
+			var release *capturedReq
+			for i := deleteAt + 1; i < len(tracker.captured); i++ {
+				c := tracker.captured[i]
+				if c.method == http.MethodHead && strings.HasSuffix(c.path, "/core/discovery") {
+					release = &tracker.captured[i]
+				}
+			}
+			if !tc.wantRelease {
+				if release != nil {
+					t.Fatalf("DELETE was followed by a HEAD on discovery although the guard is off: %+v", tracker.captured)
+				}
+				return
+			}
+			if release == nil {
+				t.Fatalf("DELETE was not followed by the stateless HEAD that retires the proxy context: %+v", tracker.captured)
+			}
+			if release.sessionType != "stateless" {
+				t.Errorf("release X-sap-adt-sessiontype = %q, want \"stateless\"", release.sessionType)
+			}
+			if release.cookie != "" {
+				t.Errorf("release Cookie = %q, want none so the proxy injects the context to be released", release.cookie)
+			}
+		})
 	}
 }

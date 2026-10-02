@@ -16,7 +16,7 @@ type CoverageResult struct {
 	Statements     CoverageStats              `json:"statements"`
 	Branches       CoverageStats              `json:"branches,omitempty"`
 	Procedures     CoverageStats              `json:"procedures,omitempty"`
-	SourceCoverage map[string]*SourceCoverage  `json:"sourceCoverage,omitempty"`
+	SourceCoverage map[string]*SourceCoverage `json:"sourceCoverage,omitempty"`
 }
 
 // CoverageStats contains aggregate coverage statistics.
@@ -40,6 +40,9 @@ func (c *Client) GetCodeCoverage(ctx context.Context, objectURL string, flags *U
 	if flags == nil {
 		defaultFlags := DefaultUnitTestFlags()
 		flags = &defaultFlags
+	}
+	if err := c.checkUnitTestRisk(flags, "GetCodeCoverage"); err != nil {
+		return nil, err
 	}
 
 	body := fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
@@ -183,7 +186,7 @@ type CheckRunResult struct {
 // CheckRunMessage represents a single message from a check run.
 type CheckRunMessage struct {
 	URI      string `json:"uri"`
-	Type     string `json:"type"`      // E=Error, W=Warning, I=Info
+	Type     string `json:"type"` // E=Error, W=Warning, I=Info
 	Line     int    `json:"line"`
 	Column   int    `json:"column"`
 	Text     string `json:"text"`

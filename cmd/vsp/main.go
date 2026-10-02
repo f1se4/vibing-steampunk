@@ -4,7 +4,11 @@ package main
 import (
 	"context"
 	"fmt"
+	"io"
+	"math"
 	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -21,6 +25,10 @@ var (
 	Version   = "dev"
 	Commit    = "unknown"
 	BuildDate = "unknown"
+	// ReleaseRepo is the owner/name of the GitHub repository this binary is
+	// released from, set by build flags; empty means the default
+	// (oisee/vibing-steampunk).
+	ReleaseRepo = ""
 )
 
 var cfg = &mcp.Config{}
@@ -37,7 +45,7 @@ Two modes of operation:
 
   MCP Server (default)  Connects Claude, Gemini CLI, Copilot, Codex, Qwen Code,
                         and other MCP-compatible agents to SAP systems.
-                        81 tools (focused), 122 (expert), or 1 universal tool (hyperfocused).
+                        98 tools (focused), 148 (expert), or 1 universal tool (hyperfocused).
 
   CLI Mode              Direct terminal access: search, source, export, debug.
                         Multi-system profiles. Useful for scripts and pipelines.
@@ -81,6 +89,13 @@ Ready-to-use configs for 8 AI agents: docs/cli-agents/`,
 		}
 		return nil
 	},
+	PersistentPostRun: func(cmd *cobra.Command, args []string) {
+		if cfg.Verbose && lastClient != nil {
+			if s := lastClient.CacheStats(); s.Enabled {
+				fmt.Fprintf(os.Stderr, "[cache] %d hits, %d misses, %d entries, %d invalidations, ttl %s\n", s.Hits, s.Misses, s.Entries, s.Invalidations, s.TTL)
+			}
+		}
+	},
 	RunE: runServer,
 }
 
@@ -113,14 +128,22 @@ func init() {
 	rootCmd.Flags().String("cookie-save", "", "Save browser auth cookies to file for reuse with --cookie-file")
 
 	// Programmatic SAML SSO authentication (no browser required)
+	rootCmd.Flags().Bool("sso", false, "Authenticate through a browser SSO handshake, re-capturing the session automatically when it expires (ignores any SAP_USER/SAP_PASSWORD)")
+	rootCmd.Flags().String("sso-system", "", "Name the cached SSO session (defaults to the URL's host)")
+	rootCmd.Flags().String("sso-trigger-url", "", "Authentication-gated URL that starts the SSO redirect (default: this system's ADT root)")
+	rootCmd.Flags().String("sso-profile", "", "Browser profile directory for SSO (a Windows path when running under WSL)")
+	rootCmd.Flags().String("sso-helper", "", "Path to the Windows SSO capture helper (vsp-sso.exe), used under WSL")
+	rootCmd.Flags().String("sso-on-expiry", "window", "When a silent SSO refresh needs a human: 'window' opens a browser, 'error' reports what to run")
 	rootCmd.Flags().Bool("saml-auth", false, "Authenticate via programmatic SAML SSO (no browser, no MFA)")
 	rootCmd.Flags().String("saml-user", "", "SAML/IAS username (email)")
 	rootCmd.Flags().String("saml-password", "", "SAML/IAS password")
 	rootCmd.Flags().String("credential-cmd", "", "External command returning JSON {\"username\":...,\"password\":...} (space-separated argv, no shell quoting — use a wrapper script for paths with spaces)")
 
-
 	// Session keep-alive
-	rootCmd.Flags().Duration("keepalive", 5*time.Minute, "Session keep-alive interval (e.g., 60s, 5m). Prevents session timeout during idle periods. 0 = disabled")
+	rootCmd.Flags().Duration("keepalive", 0, "Session keep-alive interval (e.g., 60s, 5m). Prevents session timeout during idle periods. 0 = disabled (default; see #168)")
+
+	// Long calls
+	rootCmd.Flags().Int("call-timeout", 0, "Default budget in seconds of one long MCP call (ExecuteABAP, ABAP Unit, deploy, source write, activation) that names no params.timeout; at most 3600. 0 = none: each request to SAP is limited to 60s. A negative value is a startup error")
 
 	// Safety options
 	rootCmd.Flags().BoolVar(&cfg.ReadOnly, "read-only", false, "Block all write operations (create, update, delete, activate)")
@@ -131,10 +154,17 @@ func init() {
 	rootCmd.Flags().BoolVar(&cfg.EnableTransports, "enable-transports", true, "Enable transport management operations (set to true by default in this build)")
 	rootCmd.Flags().BoolVar(&cfg.TransportReadOnly, "transport-read-only", false, "Only allow read operations on transports (list, get)")
 	rootCmd.Flags().StringSliceVar(&cfg.AllowedTransports, "allowed-transports", nil, "Restrict transport operations to specific transports (comma-separated, supports wildcards like A4HK*)")
-	rootCmd.Flags().BoolVar(&cfg.AllowTransportableEdits, "allow-transportable-edits", true, "Allow editing objects in transportable packages (requires transport parameter)")
+	// This is persistent because CLI subcommands such as `source write` must
+	// receive the same explicit transportable-edit opt-in as the MCP server.
+	// Keep it separate from the other root-only safety flags: moving all of
+	// them would broaden this command-line surface without solving #117.
+	rootCmd.PersistentFlags().BoolVar(&cfg.AllowTransportableEdits, "allow-transportable-edits", true, "Allow editing objects in transportable packages (requires transport parameter)")
+	rootCmd.Flags().StringVar(&cfg.CTSProject, "cts-project", "", "CTS project every request vsp creates is filed under, unless the call names one (for systems that require a project)")
+	rootCmd.Flags().StringVar(&cfg.TransportTarget, "transport-target", "", "Transport target of every request vsp creates, unless the call names one")
+	rootCmd.Flags().StringVar(&cfg.TransportChoice, "transport-choice", "auto", "A write with no transport named: auto picks the object's own or an open request of yours that fits (and creates one with --enable-transports); off leaves it to SAP, which generates a request per write")
 
 	// Mode options
-	rootCmd.Flags().StringVar(&cfg.Mode, "mode", "expert", "Tool mode: focused (100 tools), expert (147 tools), or hyperfocused (single universal SAP tool)")
+	rootCmd.Flags().StringVar(&cfg.Mode, "mode", "expert", "Tool mode: expert (148 tools, default in this build), focused (98 tools), or hyperfocused (single universal SAP tool)")
 	rootCmd.Flags().StringVar(&cfg.DisabledGroups, "disabled-groups", "", "Disable tool groups: 5/U=UI5, T=Tests, H=HANA, D=Debug, GC=gCTS, N=i18n")
 
 	// Transport options
@@ -167,6 +197,12 @@ func init() {
 	viper.BindPFlag("cookie-string", rootCmd.Flags().Lookup("cookie-string"))
 	viper.BindPFlag("browser-auth", rootCmd.Flags().Lookup("browser-auth"))
 	viper.BindPFlag("browser-auth-timeout", rootCmd.Flags().Lookup("browser-auth-timeout"))
+	viper.BindPFlag("sso", rootCmd.Flags().Lookup("sso"))
+	viper.BindPFlag("sso-system", rootCmd.Flags().Lookup("sso-system"))
+	viper.BindPFlag("sso-trigger-url", rootCmd.Flags().Lookup("sso-trigger-url"))
+	viper.BindPFlag("sso-profile", rootCmd.Flags().Lookup("sso-profile"))
+	viper.BindPFlag("sso-helper", rootCmd.Flags().Lookup("sso-helper"))
+	viper.BindPFlag("sso-on-expiry", rootCmd.Flags().Lookup("sso-on-expiry"))
 	viper.BindPFlag("saml-auth", rootCmd.Flags().Lookup("saml-auth"))
 	viper.BindPFlag("saml-user", rootCmd.Flags().Lookup("saml-user"))
 	viper.BindPFlag("saml-password", rootCmd.Flags().Lookup("saml-password"))
@@ -182,7 +218,7 @@ func init() {
 	viper.BindPFlag("enable-transports", rootCmd.Flags().Lookup("enable-transports"))
 	viper.BindPFlag("transport-read-only", rootCmd.Flags().Lookup("transport-read-only"))
 	viper.BindPFlag("allowed-transports", rootCmd.Flags().Lookup("allowed-transports"))
-	viper.BindPFlag("allow-transportable-edits", rootCmd.Flags().Lookup("allow-transportable-edits"))
+	viper.BindPFlag("allow-transportable-edits", rootCmd.PersistentFlags().Lookup("allow-transportable-edits"))
 	viper.BindPFlag("mode", rootCmd.Flags().Lookup("mode"))
 	viper.BindPFlag("disabled-groups", rootCmd.Flags().Lookup("disabled-groups"))
 	viper.BindPFlag("verbose", rootCmd.PersistentFlags().Lookup("verbose"))
@@ -214,6 +250,13 @@ func runServer(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
+	// Long-call budget of the MCP server: flag > SAP_CALL_TIMEOUT env
+	callTimeout, err := resolveCallTimeout(cmd)
+	if err != nil {
+		return err
+	}
+	cfg.CallTimeout = callTimeout
+
 	// Browser-based SSO authentication (must run before processCookieAuth)
 	if err := processBrowserAuth(cmd); err != nil {
 		return err
@@ -221,6 +264,11 @@ func runServer(cmd *cobra.Command, args []string) error {
 
 	// Programmatic SAML SSO authentication (must run before processCookieAuth)
 	if err := processSAMLAuth(cmd); err != nil {
+		return err
+	}
+
+	// Browser single sign-on (must run before processCookieAuth)
+	if err := processSSOAuth(cmd); err != nil {
 		return err
 	}
 
@@ -241,7 +289,7 @@ func runServer(cmd *cobra.Command, args []string) error {
 		if cfg.Username != "" {
 			fmt.Fprintf(os.Stderr, "[VERBOSE] Auth: Basic (user: %s)\n", cfg.Username)
 		} else if cfg.ReauthFunc != nil {
-			fmt.Fprintf(os.Stderr, "[VERBOSE] Auth: SAML (%d cookies, re-auth on 401)\n", len(cfg.Cookies))
+			fmt.Fprintf(os.Stderr, "[VERBOSE] Auth: SSO/SAML (%d cookies, re-authenticates when the session expires)\n", len(cfg.Cookies))
 		} else if len(cfg.Cookies) > 0 {
 			fmt.Fprintf(os.Stderr, "[VERBOSE] Auth: Cookie (%d cookies)\n", len(cfg.Cookies))
 		}
@@ -294,26 +342,78 @@ func runServer(cmd *cobra.Command, args []string) error {
 			}
 		}
 
-		// Load transport_attribute from default system if not already set via env
-		if cfg.TransportAttribute == "" && systemsCfg.Default != "" {
-			if sys, err := systemsCfg.GetSystem(systemsCfg.Default); err == nil && sys.TransportAttribute != "" {
-				cfg.TransportAttribute = sys.TransportAttribute
-			}
-		}
+		warnNamedSystemMismatch(os.Stderr, cfg, systemsCfg)
+
+		applyDefaultSystemSettings(cfg, systemsCfg)
 	}
+
+	// The binary's own identity, so SAP() can say which build answered. An
+	// agent reporting a defect against "vsp" names nothing; against a commit it
+	// names something.
+	cfg.Build = sweepBuild()
 
 	// Create and start MCP server
 	srv := mcp.NewServer(cfg)
 
-	switch cfg.Transport {
-	case "http":
-		addr := cfg.HTTPAddr
-		if cfg.Verbose {
-			fmt.Fprintf(os.Stderr, "[VERBOSE] Transport: Streamable HTTP on %s\n", addr)
+	return serveMCP(cmd, func() error {
+		switch cfg.Transport {
+		case "http":
+			addr := cfg.HTTPAddr
+			if cfg.Verbose {
+				fmt.Fprintf(os.Stderr, "[VERBOSE] Transport: Streamable HTTP on %s\n", addr)
+			}
+			return srv.ServeHTTP(addr)
+		default:
+			return srv.ServeStdio()
 		}
-		return srv.ServeHTTP(addr)
-	default:
-		return srv.ServeStdio()
+	})
+}
+
+// serveMCP runs the server once the command line is known to be good. From
+// here on an error is the server's, not the caller's spelling of a flag, so
+// cobra must not answer it with the usage text: an MCP client reads stderr as
+// the server's log, and a shutdown used to fill it with every flag vsp has.
+func serveMCP(cmd *cobra.Command, serve func() error) error {
+	cmd.SilenceUsage = true
+	return serve()
+}
+
+// warnNamedSystemMismatch says at startup when the system named by -s /
+// SAP_SYSTEM is not the one SAP_URL and SAP_CLIENT connect to. RFC use
+// refuses it later; this only makes the reason visible before then.
+func warnNamedSystemMismatch(w io.Writer, c *mcp.Config, systemsCfg *config.SystemsConfig) {
+	if c.SystemName == "" || systemsCfg == nil {
+		return
+	}
+	sys, ok := systemsCfg.Systems[c.SystemName]
+	if !ok {
+		return
+	}
+	if err := mcp.NamedSystemMismatch(c.SystemName, sys, c.BaseURL, c.Client); err != nil {
+		fmt.Fprintf(w, "[WARNING] %v; RFC calls will be refused\n", err)
+	}
+}
+
+// applyDefaultSystemSettings fills what the flags and the environment left
+// empty from the default system in .vsp.json: transport_attribute, and where a
+// request vsp creates is filed, cts_project and transport_target. The CLI takes
+// the same keys from the system it runs against (resolveSystemParams).
+func applyDefaultSystemSettings(c *mcp.Config, systemsCfg *config.SystemsConfig) {
+	if systemsCfg == nil || systemsCfg.Default == "" {
+		return
+	}
+	sys, err := systemsCfg.GetSystem(systemsCfg.Default)
+	if err != nil {
+		return
+	}
+	if c.TransportAttribute == "" && sys.TransportAttribute != "" {
+		c.TransportAttribute = sys.TransportAttribute
+	}
+	if c.CTSProject == "" && sys.CTSProject != "" {
+		c.CTSProject = sys.CTSProject
+	}
+	if c.TransportTarget == "" && sys.TransportTarget != "" {
+		c.TransportTarget = sys.TransportTarget
 	}
 }
 
@@ -327,7 +427,7 @@ func resolveConfig(cmd *cobra.Command) {
 	hasBrowserAuth := browserAuth || viper.GetBool("BROWSER_AUTH")
 	samlAuth, _ := cmd.Flags().GetBool("saml-auth")
 	hasSAMLAuth := samlAuth || viper.GetBool("SAML_AUTH")
-	hasCookieAuth := cookieAuthViaCLI || cookieAuthViaEnv || hasBrowserAuth || hasSAMLAuth
+	hasCookieAuth := cookieAuthViaCLI || cookieAuthViaEnv || hasBrowserAuth || hasSAMLAuth || ssoRequested(cmd)
 
 	// URL: flag > SAP_URL env
 	if cfg.BaseURL == "" {
@@ -422,9 +522,28 @@ func resolveConfig(cmd *cobra.Command) {
 			cfg.AllowedTransports = splitCommaSeparated(transportStr)
 		}
 	}
-	// Always OR the env var so that SAP_ALLOW_TRANSPORTABLE_EDITS=true works regardless
-	// of whether the CLI flag was recognised as Changed by cobra (e.g. MCP clients).
-	cfg.AllowTransportableEdits = cfg.AllowTransportableEdits || viper.GetBool("ALLOW_TRANSPORTABLE_EDITS")
+	// Tradebe build: the flag defaults to true; the env var only overrides it when it is set.
+	if !cmd.Flags().Changed("allow-transportable-edits") {
+		if v := viper.GetString("ALLOW_TRANSPORTABLE_EDITS"); v != "" {
+			cfg.AllowTransportableEdits = viper.GetBool("ALLOW_TRANSPORTABLE_EDITS")
+		}
+	}
+	// The server's own system in .vsp.json, for its per-system settings.
+	cfg.SystemName = systemName
+	if cfg.SystemName == "" {
+		cfg.SystemName = viper.GetString("SYSTEM")
+	}
+	if !cmd.Flags().Changed("transport-choice") {
+		if v := viper.GetString("TRANSPORT_CHOICE"); v != "" {
+			cfg.TransportChoice = v
+		}
+	}
+	if !cmd.Flags().Changed("cts-project") {
+		cfg.CTSProject = viper.GetString("CTS_PROJECT")
+	}
+	if !cmd.Flags().Changed("transport-target") {
+		cfg.TransportTarget = viper.GetString("TRANSPORT_TARGET")
+	}
 
 	// Feature configuration: flag > SAP_FEATURE_* env
 	if !cmd.Flags().Changed("feature-hana") {
@@ -482,6 +601,58 @@ func resolveConfig(cmd *cobra.Command) {
 	}
 }
 
+// resolveCallTimeout reads --call-timeout, else SAP_CALL_TIMEOUT: seconds
+// (the env also takes a Go duration such as 5m). 0, or nothing set, means no
+// budget of the server's own. Anything else that is not at least one second
+// is an error, not a silent "no budget": a typo would otherwise take the limit
+// the operator meant to set away without a word. Capped at MaxCallTimeout.
+func resolveCallTimeout(cmd *cobra.Command) (time.Duration, error) {
+	var d time.Duration
+	var source string
+	if cmd.Flags().Changed("call-timeout") {
+		secs, err := cmd.Flags().GetInt("call-timeout")
+		if err != nil {
+			return 0, fmt.Errorf("--call-timeout: %w", err)
+		}
+		source = fmt.Sprintf("--call-timeout %d", secs)
+		if secs < 0 {
+			return 0, fmt.Errorf("%s: must be a number of seconds, at least 1 (0 for none)", source)
+		}
+		if secs > int(mcp.MaxCallTimeout/time.Second) {
+			return mcp.MaxCallTimeout, nil
+		}
+		d = time.Duration(secs) * time.Second
+	} else if v := strings.TrimSpace(viper.GetString("CALL_TIMEOUT")); v != "" {
+		source = fmt.Sprintf("SAP_CALL_TIMEOUT=%q", v)
+		if f, err := strconv.ParseFloat(v, 64); err == nil {
+			if math.IsNaN(f) || math.IsInf(f, 0) || f < 0 {
+				return 0, fmt.Errorf("%s: must be a number of seconds, at least 1 (0 for none)", source)
+			}
+			if f > mcp.MaxCallTimeout.Seconds() {
+				return mcp.MaxCallTimeout, nil
+			}
+			d = time.Duration(f * float64(time.Second))
+		} else if pd, err := time.ParseDuration(v); err == nil {
+			if pd < 0 {
+				return 0, fmt.Errorf("%s: must not be negative", source)
+			}
+			d = pd
+		} else {
+			return 0, fmt.Errorf("%s: not a number of seconds or a duration such as 5m", source)
+		}
+	}
+	if d == 0 {
+		return 0, nil
+	}
+	if d < time.Second {
+		return 0, fmt.Errorf("%s: below 1s; give at least one second, or 0 for none", source)
+	}
+	if d > mcp.MaxCallTimeout {
+		d = mcp.MaxCallTimeout
+	}
+	return d, nil
+}
+
 func validateConfig() error {
 	if cfg.BaseURL == "" {
 		return fmt.Errorf("SAP URL is required. Use --url flag or SAP_URL environment variable")
@@ -523,8 +694,14 @@ func processBrowserAuth(cmd *cobra.Command) error {
 		browserExec = viper.GetString("BROWSER_EXEC")
 	}
 
+	// Determine sap client
+	sapClient := cfg.Client
+	if sapClient == "" {
+		sapClient = viper.GetString("CLIENT")
+	}
+
 	ctx := cmd.Context()
-	cookies, err := adt.BrowserLogin(ctx, cfg.BaseURL, cfg.InsecureSkipVerify, timeout, browserExec, cfg.Verbose)
+	cookies, err := adt.BrowserLogin(ctx, cfg.BaseURL, cfg.InsecureSkipVerify, timeout, browserExec, cfg.Verbose, sapClient)
 	if err != nil {
 		return fmt.Errorf("browser authentication failed: %w", err)
 	}
@@ -544,6 +721,76 @@ func processBrowserAuth(cmd *cobra.Command) error {
 		}
 	}
 
+	return nil
+}
+
+// ssoRequested reports whether browser single sign-on was asked for.
+func ssoRequested(cmd *cobra.Command) bool {
+	sso, _ := cmd.Flags().GetBool("sso")
+	return sso || viper.GetBool("SSO")
+}
+
+// processSSOAuth sets up browser single sign-on for the server.
+//
+// Unlike the other auth flows, this one does not just hand over cookies and
+// retire: it leaves a way to capture new ones behind. A server that runs for
+// days will outlive any session it starts with, and the point of the exercise
+// is that nobody has to notice when it does.
+func processSSOAuth(cmd *cobra.Command) error {
+	if !ssoRequested(cmd) {
+		return nil
+	}
+	if cfg.BaseURL == "" {
+		return fmt.Errorf("--sso requires --url to be set")
+	}
+
+	// SSO is exclusive, and deliberately so. A username and password reaching
+	// the client alongside the cookies would not merely be redundant: basic
+	// auth wins in the transport, and the automatic recovery is switched off
+	// with it, because a client that can resend a password has no reason to go
+	// looking for a browser. Silently pairing the two would turn "session
+	// refreshes itself" into "session dies quietly at some point", so any
+	// credential that arrived by flag or environment is dropped here, loudly.
+	if cfg.Username != "" || cfg.Password != "" {
+		fmt.Fprintf(os.Stderr, "[SSO] ignoring the username/password supplied for %s — single sign-on is authoritative\n", cfg.BaseURL)
+		cfg.Username, cfg.Password = "", ""
+	}
+
+	stringOpt := func(flag, viperKey string) string {
+		if v, _ := cmd.Flags().GetString(flag); v != "" {
+			return v
+		}
+		return viper.GetString(viperKey)
+	}
+
+	onExpiry := stringOpt("sso-on-expiry", "SSO_ON_EXPIRY")
+	provider, err := adt.NewSSOProvider(adt.SSOConfig{
+		System:      stringOpt("sso-system", "SSO_SYSTEM"),
+		BaseURL:     cfg.BaseURL,
+		Client:      cfg.Client,
+		TriggerURL:  stringOpt("sso-trigger-url", "SSO_TRIGGER_URL"),
+		Profile:     stringOpt("sso-profile", "SSO_PROFILE"),
+		HelperPath:  stringOpt("sso-helper", "SSO_HELPER"),
+		Interactive: !strings.EqualFold(onExpiry, "error"),
+		Insecure:    cfg.InsecureSkipVerify,
+		Verbose:     cfg.Verbose,
+	})
+	if err != nil {
+		return err
+	}
+
+	cookies, err := provider.Cookies(cmd.Context())
+	if err != nil {
+		return fmt.Errorf("browser SSO: %w", err)
+	}
+	cfg.Cookies = cookies
+	cfg.ReauthFunc = provider.Refresh
+	cfg.ReauthTimeout = provider.ReauthBudget()
+
+	if cfg.Verbose {
+		fmt.Fprintf(os.Stderr, "[SSO] session ready (%d cookies), cached at %s\n",
+			len(cookies), provider.CachePath())
+	}
 	return nil
 }
 
@@ -685,8 +932,9 @@ func processCookieAuth(cmd *cobra.Command) error {
 
 	// Process cookie file
 	if cookieFile != "" {
-		if _, err := os.Stat(cookieFile); os.IsNotExist(err) {
-			return fmt.Errorf("cookie file not found: %s", cookieFile)
+		cookieFile, err := filepath.Abs(cookieFile)
+		if err != nil {
+			return fmt.Errorf("resolving cookie file path: %w", err)
 		}
 
 		cookies, err := adt.LoadCookiesFromFile(cookieFile)
@@ -699,6 +947,12 @@ func processCookieAuth(cmd *cobra.Command) error {
 		}
 
 		cfg.Cookies = cookies
+		reauth, err := adt.NewCookieFileReauthFunc(cookieFile)
+		if err != nil {
+			return err
+		}
+		cfg.ReauthFunc = reauth
+		cfg.ReauthReadOnly = true
 		if cfg.Verbose {
 			fmt.Fprintf(os.Stderr, "[VERBOSE] Loaded %d cookies from file: %s\n", len(cookies), cookieFile)
 		}

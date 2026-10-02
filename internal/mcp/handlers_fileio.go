@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"strings"
 
 	"github.com/mark3labs/mcp-go/mcp"
@@ -33,6 +34,11 @@ func (s *Server) routeFileIOAction(ctx context.Context, action, objectType, obje
 // Note: CreateFromFile and UpdateFromFile handlers removed - use DeployFromFile instead
 
 func (s *Server) handleDeployFromFile(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	return s.longCall(ctx, request, "deploy_from_file", s.deployFromFile)
+}
+
+// deployFromFile is handleDeployFromFile without the call budget (see longCall).
+func (s *Server) deployFromFile(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	filePath, ok := request.GetArguments()["file_path"].(string)
 	if !ok || filePath == "" {
 		return newToolResultError("file_path is required"), nil
@@ -47,14 +53,24 @@ func (s *Server) handleDeployFromFile(ctx context.Context, request mcp.CallToolR
 	if t, ok := request.GetArguments()["transport"].(string); ok {
 		transport = t
 	}
-
-	result, err := s.adtClient.DeployFromFile(ctx, filePath, packageName, transport)
+	expectedSourceHash, _ := request.GetArguments()["expected_source_hash"].(string)
+	result, err := s.adtClient.DeployFromFileWithOptions(ctx, filePath, packageName, transport, &adt.DeployFromFileOptions{
+		ExpectedSourceHash: expectedSourceHash,
+	})
 	if err != nil {
 		return newToolResultError(fmt.Sprintf("DeployFromFile failed: %v", err)), nil
 	}
 
 	output, _ := json.MarshalIndent(result, "", "  ")
-	return mcp.NewToolResultText(string(output)), nil
+	res := mcp.NewToolResultText(string(output))
+	if result != nil && result.Success {
+		res = s.withDescription(ctx, res, result.ObjectType, result.ObjectName, getStringParam(request.GetArguments(), "parent"), getStringParam(request.GetArguments(), "description"), transport)
+	}
+	if result != nil && result.Success && strings.HasPrefix(strings.ToUpper(result.ObjectType), "PROG") {
+		src, _ := os.ReadFile(filePath)
+		res = withHint(res, s.textPoolHint(ctx, adt.TextPoolTarget{Type: "PROG", Name: result.ObjectName}, string(src)))
+	}
+	return res, nil
 }
 
 func (s *Server) handleSaveToFile(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -182,7 +198,6 @@ func (s *Server) handleRenameObject(ctx context.Context, request mcp.CallToolReq
 	if t, ok := request.GetArguments()["transport"].(string); ok {
 		transport = t
 	}
-
 	// Parse object type
 	objType := adt.CreatableObjectType(objTypeStr)
 
@@ -195,7 +210,14 @@ func (s *Server) handleRenameObject(ctx context.Context, request mcp.CallToolReq
 	return mcp.NewToolResultText(string(output)), nil
 }
 
+// handleEditSource is a long call for the same reason as WriteSource: it
+// writes and activates.
 func (s *Server) handleEditSource(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	return s.longCall(ctx, request, "EditSource", s.editSource)
+}
+
+// editSource is handleEditSource without the call budget (see longCall).
+func (s *Server) editSource(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	objectURL, ok := request.GetArguments()["object_url"].(string)
 	if !ok || objectURL == "" {
 		return newToolResultError("object_url is required"), nil
@@ -231,6 +253,9 @@ func (s *Server) handleEditSource(ctx context.Context, request mcp.CallToolReque
 		method = m
 	}
 
+	// Accepted and ignored. Warnings no longer block an edit (#131), so this
+	// has no effect — it is still read so an existing caller that passes it is
+	// not rejected for sending an argument that used to be required.
 	ignoreWarnings := false
 	if iw, ok := request.GetArguments()["ignore_warnings"].(bool); ok {
 		ignoreWarnings = iw
@@ -240,14 +265,16 @@ func (s *Server) handleEditSource(ctx context.Context, request mcp.CallToolReque
 	if t, ok := request.GetArguments()["transport"].(string); ok {
 		transport = t
 	}
+	expectedSourceHash, _ := request.GetArguments()["expected_source_hash"].(string)
 
 	opts := &adt.EditSourceOptions{
-		ReplaceAll:      replaceAll,
-		SyntaxCheck:     syntaxCheck,
-		IgnoreWarnings:  ignoreWarnings,
-		CaseInsensitive: caseInsensitive,
-		Method:          method,
-		Transport:       transport,
+		ReplaceAll:         replaceAll,
+		SyntaxCheck:        syntaxCheck,
+		IgnoreWarnings:     ignoreWarnings,
+		CaseInsensitive:    caseInsensitive,
+		Method:             method,
+		Transport:          transport,
+		ExpectedSourceHash: expectedSourceHash,
 	}
 
 	result, err := s.adtClient.EditSourceWithOptions(ctx, objectURL, oldString, newString, opts)

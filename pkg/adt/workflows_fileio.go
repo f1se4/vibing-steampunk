@@ -12,11 +12,11 @@ import (
 
 // RenameObjectResult contains the result of renaming an object.
 type RenameObjectResult struct {
-	OldName    string `json:"oldName"`
-	NewName    string `json:"newName"`
-	ObjectType string `json:"objectType"`
-	Success    bool   `json:"success"`
-	Message    string `json:"message,omitempty"`
+	OldName    string   `json:"oldName"`
+	NewName    string   `json:"newName"`
+	ObjectType string   `json:"objectType"`
+	Success    bool     `json:"success"`
+	Message    string   `json:"message,omitempty"`
 	Errors     []string `json:"errors,omitempty"`
 }
 
@@ -32,18 +32,37 @@ func (c *Client) RenameObject(ctx context.Context, objType CreatableObjectType, 
 		ObjectType: string(objType),
 	}
 
-	oldURL, err := c.buildObjectURL(objType, oldName)
+	// A function module is addressable only under its group, and unlike a
+	// deploy there is no filename to read it from — the caller passes a bare
+	// module name. It does not have to be asked for either: TFDIR maps the
+	// module to its group, which is what ResolveFunctionGroup reads. Without
+	// this both URLs below came back as "function module requires parent
+	// function group name", about a group nobody was ever going to type.
+	parentName := ""
+	if objType == ObjectTypeFunctionMod {
+		group, gerr := c.ResolveFunctionGroup(ctx, oldName)
+		if gerr != nil {
+			return nil, fmt.Errorf("resolving the function group of %s: %w", oldName, gerr)
+		}
+		parentName = group
+	}
+
+	oldURL, err := c.buildObjectURLWithParent(objType, oldName, parentName)
 	if err != nil {
 		return nil, err
 	}
 
-	// Unified mutation policy gate for the old object being deleted.
-	if err := c.checkMutation(ctx, MutationContext{
+	// Unified mutation policy gate for the old object being deleted. The mark
+	// on the returned context covers exactly the object this gate resolved, so
+	// the DeleteObject at the end does not resolve it again while holding the
+	// lock it is about to use (issue #91).
+	ctx, err = c.gateAndMark(ctx, MutationContext{
 		Op:        OpDelete,
 		OpName:    "RenameObject",
 		ObjectURL: oldURL,
 		Transport: transport,
-	}); err != nil {
+	})
+	if err != nil {
 		return nil, err
 	}
 
@@ -87,16 +106,38 @@ func (c *Client) RenameObject(ctx context.Context, objType CreatableObjectType, 
 		return result, nil
 	}
 
-	// 4. Write source to new object
-	newURL, _ := c.buildObjectURL(objType, newName)
-	lockResult, err := c.LockObject(ctx, newURL, "MODIFY")
+	// 4. Write source to new object. Renaming a module does not move it between
+	// groups, so the group resolved above is the new object's too.
+	newURL, urlErr := c.buildObjectURLWithParent(objType, newName, parentName)
+	if urlErr != nil {
+		result.Errors = append(result.Errors, fmt.Sprintf("Failed to address the new object: %v", urlErr))
+		return result, nil
+	}
+	// The new object was created in packageName, which the create-side gate
+	// above accepted (and CreateObject checked again). Only mark when a
+	// package was actually supplied and therefore actually checked: with
+	// packageName empty there is no approved package to stand behind, and
+	// leaving the mark off makes UpdateSource fall back to the full gate.
+	if packageName != "" {
+		ctx = withMutationPackageChecked(ctx, newURL)
+	}
+
+	lockResult, err := c.LockObject(ctx, newURL, "MODIFY", transport)
 	if err != nil {
 		result.Errors = append(result.Errors, fmt.Sprintf("Failed to lock new object: %v", err))
 		return result, nil
 	}
 
+	// Track the release explicitly. The old form was an unconditional defer
+	// plus an inline unlock on the happy path, so every successful rename sent
+	// a second UNLOCK for a handle that was already gone.
+	newUnlocked := false
 	defer func() {
-		_ = c.UnlockObject(ctx, newURL, lockResult.LockHandle)
+		if !newUnlocked {
+			if unlockErr := c.releaseLockAfterFailure(ctx, newURL, lockResult.LockHandle); unlockErr != nil {
+				result.Errors = append(result.Errors, strandedLockAdvice(newURL, unlockErr))
+			}
+		}
 	}()
 
 	err = c.UpdateSource(ctx, newURL, newSource, lockResult.LockHandle, transport)
@@ -105,22 +146,49 @@ func (c *Client) RenameObject(ctx context.Context, objType CreatableObjectType, 
 		return result, nil
 	}
 
-	_ = c.UnlockObject(ctx, newURL, lockResult.LockHandle)
+	newUnlocked = true
+	if unlockErr := c.UnlockObject(ctx, newURL, lockResult.LockHandle); unlockErr != nil {
+		result.Errors = append(result.Errors, strandedLockAdvice(newURL, unlockErr))
+	}
 
 	// 5. Activate new object
-	_, err = c.Activate(ctx, newURL, newName)
+	activation, err := c.Activate(ctx, newURL, newName)
 	if err != nil {
 		result.Errors = append(result.Errors, fmt.Sprintf("Failed to activate new object: %v", err))
 		return result, nil
 	}
+	// Step 6 deletes the original, and it must not run on the strength of an
+	// activation nobody read. A refusal arrives inside a 200 with the reason in
+	// the body, so looking only at err would delete the object that worked and
+	// keep the copy that does not compile. The copy is left behind, inactive,
+	// for whoever comes to fix it.
+	if !activation.Success {
+		result.Errors = append(result.Errors, activation.ProblemLines()...)
+		result.Message = fmt.Sprintf("%s was created but would not activate, so %s has been left exactly where it was", newName, oldName)
+		return result, nil
+	}
 
 	// 6. Delete old object
-	oldLockResult, err := c.LockObject(ctx, oldURL, "MODIFY")
+	oldLockResult, err := c.LockObject(ctx, oldURL, "MODIFY", transport)
 	if err != nil {
 		result.Message = fmt.Sprintf("New object %s created successfully, but failed to lock old object %s for deletion: %v. Please delete manually.", newName, oldName, err)
 		result.Success = true
 		return result, nil
 	}
+
+	// A successful DELETE consumes the lock with the object; anything else
+	// leaves the ENQUEUE on an object the user has just been told to delete by
+	// hand — which is precisely what would make the manual delete fail. This
+	// branch had no defer at all, so the failure path returned Success=true
+	// with the lock still held and nothing said about it.
+	oldReleased := false
+	defer func() {
+		if !oldReleased {
+			if unlockErr := c.releaseLockAfterFailure(ctx, oldURL, oldLockResult.LockHandle); unlockErr != nil {
+				result.Errors = append(result.Errors, strandedLockAdvice(oldURL, unlockErr))
+			}
+		}
+	}()
 
 	err = c.DeleteObject(ctx, oldURL, oldLockResult.LockHandle, transport)
 	if err != nil {
@@ -128,6 +196,7 @@ func (c *Client) RenameObject(ctx context.Context, objType CreatableObjectType, 
 		result.Success = true
 		return result, nil
 	}
+	oldReleased = true
 
 	result.Success = true
 	result.Message = fmt.Sprintf("Successfully renamed %s to %s", oldName, newName)
@@ -144,6 +213,74 @@ type SaveToFileResult struct {
 	Message    string `json:"message,omitempty"`
 }
 
+// exportExtension is the file suffix ExportToFile writes for each type: the
+// one ParseABAPFile reads back as the same type.
+func exportExtension(objType CreatableObjectType) string {
+	switch objType {
+	case ObjectTypeClass:
+		return ".clas.abap"
+	case ObjectTypeProgram:
+		return ".prog.abap"
+	case ObjectTypeInterface:
+		return ".intf.abap"
+	case ObjectTypeFunctionGroup:
+		return ".fugr.abap"
+	case ObjectTypeFunctionMod:
+		return ".func.abap"
+	case ObjectTypeInclude:
+		// Plain .abap made the importer guess, and an include has nothing in
+		// it to guess from (issue #235).
+		return ".incl.abap"
+	// RAP object types (using ABAPGit-compatible extensions)
+	case ObjectTypeDDLS:
+		return ".ddls.asddls"
+	case ObjectTypeBDEF:
+		return ".bdef.asbdef"
+	case ObjectTypeSRVD:
+		return ".srvd.srvdsrv"
+	default:
+		return ".abap"
+	}
+}
+
+// ExportFilePath is the path ExportToFile writes an object to. outputPath is
+// either a directory or the file itself. It is the file when it already ends
+// in the type's suffix (case aside); an include also accepts a bare
+// {name}.abap, which is what its suffix used to be, but not a name carrying
+// another type's suffix such as zx.prog.abap, which would read back as that
+// type.
+//
+// A function module exported with its group gets abapGit's name,
+// {group}.fugr.{module}.abap, which carries the group the module is addressed
+// under; without a group it is {module}.func.abap.
+func ExportFilePath(objType CreatableObjectType, objectName, parentName, outputPath string) (string, error) {
+	if outputPath == "" {
+		outputPath = "."
+	}
+	base := filepath.Base(outputPath)
+	lowerBase := strings.ToLower(base)
+	switch {
+	case strings.HasSuffix(lowerBase, exportExtension(objType)):
+		return outputPath, nil
+	case objType == ObjectTypeFunctionMod:
+		if _, _, ok := fugrMember(base); ok {
+			return outputPath, nil
+		}
+	case objType == ObjectTypeInclude && strings.HasSuffix(lowerBase, ".abap"):
+		if strings.Contains(strings.TrimSuffix(lowerBase, ".abap"), ".") {
+			return "", fmt.Errorf("cannot export include %s to %s: that name says another type and would read back as it; use {name}.incl.abap", objectName, base)
+		}
+		return outputPath, nil
+	}
+	// Replace namespace slashes with # for filesystem compatibility (abapGit convention)
+	safe := func(name string) string { return strings.ReplaceAll(strings.ToLower(name), "/", "#") }
+	fileName := safe(objectName) + exportExtension(objType)
+	if objType == ObjectTypeFunctionMod && parentName != "" {
+		fileName = safe(parentName) + ".fugr." + safe(objectName) + ".abap"
+	}
+	return filepath.Join(outputPath, fileName), nil
+}
+
 // SaveToFile saves an ABAP object's source code to a local file.
 //
 // Workflow: GetSource → WriteFile
@@ -155,45 +292,12 @@ func (c *Client) SaveToFile(ctx context.Context, objType CreatableObjectType, ob
 		ObjectType: string(objType),
 	}
 
-	// 1. Determine file extension
-	var ext string
-	switch objType {
-	case ObjectTypeClass:
-		ext = ".clas.abap"
-	case ObjectTypeProgram:
-		ext = ".prog.abap"
-	case ObjectTypeInterface:
-		ext = ".intf.abap"
-	case ObjectTypeFunctionGroup:
-		ext = ".fugr.abap"
-	case ObjectTypeFunctionMod:
-		ext = ".func.abap"
-	case ObjectTypeInclude:
-		ext = ".abap"
-	// RAP object types (using ABAPGit-compatible extensions)
-	case ObjectTypeDDLS:
-		ext = ".ddls.asddls"
-	case ObjectTypeBDEF:
-		ext = ".bdef.asbdef"
-	case ObjectTypeSRVD:
-		ext = ".srvd.srvdsrv"
-	default:
-		ext = ".abap"
+	// 1-2. Build the file path; ExportFilePath says how each type is named.
+	filePath, err := ExportFilePath(objType, objectName, parentName, outputPath)
+	if err != nil {
+		return nil, err
 	}
-
-	// 2. Build file path
-	if outputPath == "" {
-		outputPath = "."
-	}
-	if !strings.HasSuffix(outputPath, ext) {
-		// outputPath is a directory
-		objectName = strings.ToLower(objectName)
-		// Replace namespace slashes with # for filesystem compatibility (abapGit convention)
-		safeFileName := strings.ReplaceAll(objectName, "/", "#")
-		result.FilePath = filepath.Join(outputPath, safeFileName+ext)
-	} else {
-		result.FilePath = outputPath
-	}
+	result.FilePath = filePath
 
 	// 3. Get object source
 	objectURL, err := c.buildObjectURLWithParent(objType, objectName, parentName)
@@ -214,6 +318,16 @@ func (c *Client) SaveToFile(ctx context.Context, objType CreatableObjectType, ob
 	result.LineCount = len(strings.Split(source, "\n"))
 
 	// 4. Write to file
+	// Create the directory rather than failing on it. A caller naming an output
+	// directory has said where they want the file; refusing because that
+	// directory does not exist yet turns a one-line call into two, and the error
+	// arrives as a write failure on the object rather than as "make the folder".
+	if dir := filepath.Dir(result.FilePath); dir != "" && dir != "." {
+		if mkErr := os.MkdirAll(dir, 0755); mkErr != nil {
+			return nil, fmt.Errorf("creating output directory %s: %w", dir, mkErr)
+		}
+	}
+
 	err = os.WriteFile(result.FilePath, []byte(source), 0644)
 	if err != nil {
 		result.Message = fmt.Sprintf("Failed to write file: %v", err)
@@ -282,6 +396,16 @@ func (c *Client) SaveClassIncludeToFile(ctx context.Context, className string, i
 	result.LineCount = len(strings.Split(source, "\n"))
 
 	// 4. Write to file
+	// Create the directory rather than failing on it. A caller naming an output
+	// directory has said where they want the file; refusing because that
+	// directory does not exist yet turns a one-line call into two, and the error
+	// arrives as a write failure on the object rather than as "make the folder".
+	if dir := filepath.Dir(result.FilePath); dir != "" && dir != "." {
+		if mkErr := os.MkdirAll(dir, 0755); mkErr != nil {
+			return nil, fmt.Errorf("creating output directory %s: %w", dir, mkErr)
+		}
+	}
+
 	err = os.WriteFile(result.FilePath, []byte(source), 0644)
 	if err != nil {
 		result.Message = fmt.Sprintf("Failed to write file: %v", err)
